@@ -149,11 +149,11 @@ class TensorRTQwenVL:
         }
 
     def _resolve_engine_dirs(self, root: Path) -> tuple[Path, Path]:
-        env_engine_dir = os.environ.get("EDGELLM_ENGINE_DIR")
-        env_visual_dir = os.environ.get("EDGELLM_MULTIMODAL_ENGINE_DIR")
+        env_engine_dir = self._usable_env_path("EDGELLM_ENGINE_DIR")
+        env_visual_dir = self._usable_env_path("EDGELLM_MULTIMODAL_ENGINE_DIR")
         if env_engine_dir and env_visual_dir:
-            return self._require_dir(Path(env_engine_dir).expanduser(), "EDGELLM_ENGINE_DIR"), self._require_dir(
-                Path(env_visual_dir).expanduser(),
+            return self._require_dir(env_engine_dir, "EDGELLM_ENGINE_DIR"), self._require_dir(
+                env_visual_dir,
                 "EDGELLM_MULTIMODAL_ENGINE_DIR",
             )
 
@@ -210,9 +210,9 @@ class TensorRTQwenVL:
         )
 
     def _resolve_llm_inference_bin(self) -> Path:
-        env_path = os.environ.get("EDGELLM_LLM_INFERENCE_BIN")
+        env_path = self._usable_env_path("EDGELLM_LLM_INFERENCE_BIN")
         if env_path:
-            return self._require_file(Path(env_path).expanduser(), "EDGELLM_LLM_INFERENCE_BIN")
+            return self._require_file(env_path, "EDGELLM_LLM_INFERENCE_BIN")
 
         path_hit = shutil.which("llm_inference")
         if path_hit:
@@ -235,9 +235,9 @@ class TensorRTQwenVL:
         )
 
     def _resolve_plugin_path(self) -> Path | None:
-        env_path = os.environ.get("EDGELLM_PLUGIN_PATH")
+        env_path = self._usable_env_path("EDGELLM_PLUGIN_PATH")
         if env_path:
-            return self._require_file(Path(env_path).expanduser(), "EDGELLM_PLUGIN_PATH")
+            return self._require_file(env_path, "EDGELLM_PLUGIN_PATH")
 
         candidates = [
             "~/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so",
@@ -250,6 +250,22 @@ class TensorRTQwenVL:
             if path.exists():
                 return path
         return None
+
+    def _usable_env_path(self, name: str) -> Path | None:
+        value = os.environ.get(name, "").strip()
+        if not value or self._looks_like_placeholder(value):
+            return None
+        return Path(value).expanduser()
+
+    def _looks_like_placeholder(self, value: str) -> bool:
+        normalized = value.strip().lower()
+        return (
+            normalized.startswith("/path/to")
+            or normalized.startswith("path/to")
+            or normalized.startswith("/actual/path")
+            or normalized.startswith("actual/path")
+            or "실제/경로" in value
+        )
 
     def _require_dir(self, path: Path, label: str) -> Path:
         if not path.is_dir():
