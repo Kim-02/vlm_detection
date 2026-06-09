@@ -30,7 +30,9 @@ from vlm_engine import TensorRTQwenVL
 
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0"
+    "rtsp_transport;tcp|rtsp_flags;prefer_tcp|fflags;nobuffer|"
+    "flags;low_delay|max_delay;0|reorder_queue_size;0|"
+    "analyzeduration;0|probesize;32"
 )
 
 templates = Jinja2Templates(directory="templates")
@@ -58,7 +60,9 @@ latest_frame_lock = threading.RLock()
 latest_frame = None
 
 jpeg_lock = threading.RLock()
+jpeg_condition = threading.Condition(jpeg_lock)
 latest_jpeg: bytes | None = None
+latest_jpeg_seq = 0
 
 stream_lock = threading.RLock()
 stream_thread: threading.Thread | None = None
@@ -641,6 +645,7 @@ def draw_selected_bbox(frame_bgr):
 
 
 def publish_jpeg(frame_bgr) -> None:
+    global latest_jpeg, latest_jpeg_seq
     with settings_lock:
         quality = int(settings["jpeg_quality"])
     display = draw_selected_bbox(frame_bgr.copy())
@@ -648,14 +653,33 @@ def publish_jpeg(frame_bgr) -> None:
         ".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
     )
     if ok:
-        with jpeg_lock:
-            global latest_jpeg
+        with jpeg_condition:
             latest_jpeg = jpeg.tobytes()
+            latest_jpeg_seq += 1
+            jpeg_condition.notify_all()
+
+
+def clear_latest_video() -> None:
+    global latest_frame, latest_jpeg, latest_jpeg_seq
+    with latest_frame_lock:
+        latest_frame = None
+    with jpeg_condition:
+        latest_jpeg = None
+        latest_jpeg_seq += 1
+        jpeg_condition.notify_all()
 
 
 def open_capture(rtsp_url: str):
     cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    capture_props = {
+        "CAP_PROP_BUFFERSIZE": 1,
+        "CAP_PROP_OPEN_TIMEOUT_MSEC": 2000,
+        "CAP_PROP_READ_TIMEOUT_MSEC": 2000,
+    }
+    for name, value in capture_props.items():
+        prop = getattr(cv2, name, None)
+        if prop is not None:
+            cap.set(prop, value)
     return cap
 
 
@@ -741,18 +765,27 @@ def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
         emit_status("검증 실패 / 재탐색 필요", "verify_failed")
 
 
-def rtsp_capture_worker(rtsp_url: str, stop_event: threading.Event, generation: int) -> None:
-    global latest_frame, tracker
+def set_stream_error(generation: int, message: str | None) -> None:
+    with stream_lock:
+        if generation == stream_state["generation"]:
+            stream_state["error"] = message
+
+
+def rtsp_reader_worker(
+    rtsp_url: str,
+    stop_event: threading.Event,
+    generation: int,
+    frame_condition: threading.Condition,
+    shared_frame: dict[str, Any],
+) -> None:
+    global latest_frame
     cap = open_capture(rtsp_url)
     reconnect_delay = 0.2
 
     while not stop_event.is_set():
-        started = time.time()
         ret, frame = cap.read()
-        if not ret:
-            with stream_lock:
-                if generation == stream_state["generation"]:
-                    stream_state["error"] = "frame read failed; reconnecting"
+        if not ret or frame is None:
+            set_stream_error(generation, "frame read failed; reconnecting")
             cap.release()
             if stop_event.wait(reconnect_delay):
                 break
@@ -760,64 +793,110 @@ def rtsp_capture_worker(rtsp_url: str, stop_event: threading.Event, generation: 
             continue
 
         with stream_lock:
-            if generation == stream_state["generation"]:
-                stream_state["error"] = None
+            if generation != stream_state["generation"]:
+                break
+
+        set_stream_error(generation, None)
 
         with latest_frame_lock:
-            latest_frame = frame.copy()
+            latest_frame = frame
 
-        current_bbox: list[int] | None = None
-        tracker_failed = False
-        with tracking_lock:
-            if tracking_state["active"] and tracker is not None:
-                try:
-                    updated, box = tracker.update(frame)
-                    if updated:
-                        height, width = frame.shape[:2]
-                        current_bbox = xywh_to_xyxy(box, width, height)
-                except Exception as exc:
-                    updated = False
-                    tracking_state["last_verify_result"] = {
-                        "found": False,
-                        "label": "",
-                        "confidence": None,
-                        "message": f"tracker_error: {exc}",
-                        "time": now_iso(),
-                    }
-
-                if updated:
-                    tracking_state["bbox"] = current_bbox
-                    tracking_state["status"] = "tracking"
-                else:
-                    tracking_state["request_id"] += 1
-                    tracker = None
-                    tracking_state["active"] = False
-                    tracking_state["status"] = "lost"
-                    tracking_state["bbox"] = None
-                    tracking_state["verifying"] = False
-                    tracking_state["last_verify_result"] = {
-                        "found": False,
-                        "label": "",
-                        "confidence": None,
-                        "message": "tracker_update_failed",
-                        "time": now_iso(),
-                    }
-                    tracker_failed = True
-
-        if current_bbox:
-            maybe_start_verification(frame.copy(), current_bbox)
-        elif tracker_failed:
-            emit_status("트래커 실패 / 재탐색 필요", "tracking_failed")
-
-        publish_jpeg(frame)
-
-        with settings_lock:
-            fps = max(1, int(settings["capture_fps"]))
-        delay = max(0.0, (1.0 / fps) - (time.time() - started))
-        if delay and stop_event.wait(delay):
-            break
+        with frame_condition:
+            shared_frame["frame"] = frame
+            shared_frame["seq"] += 1
+            shared_frame["time"] = time.time()
+            frame_condition.notify_all()
 
     cap.release()
+
+
+def process_stream_frame(frame) -> None:
+    global tracker
+    current_bbox: list[int] | None = None
+    tracker_failed = False
+    with tracking_lock:
+        if tracking_state["active"] and tracker is not None:
+            try:
+                updated, box = tracker.update(frame)
+                if updated:
+                    height, width = frame.shape[:2]
+                    current_bbox = xywh_to_xyxy(box, width, height)
+            except Exception as exc:
+                updated = False
+                tracking_state["last_verify_result"] = {
+                    "found": False,
+                    "label": "",
+                    "confidence": None,
+                    "message": f"tracker_error: {exc}",
+                    "time": now_iso(),
+                }
+
+            if updated:
+                tracking_state["bbox"] = current_bbox
+                tracking_state["status"] = "tracking"
+            else:
+                tracking_state["request_id"] += 1
+                tracker = None
+                tracking_state["active"] = False
+                tracking_state["status"] = "lost"
+                tracking_state["bbox"] = None
+                tracking_state["verifying"] = False
+                tracking_state["last_verify_result"] = {
+                    "found": False,
+                    "label": "",
+                    "confidence": None,
+                    "message": "tracker_update_failed",
+                    "time": now_iso(),
+                }
+                tracker_failed = True
+
+    if current_bbox:
+        maybe_start_verification(frame.copy(), current_bbox)
+    elif tracker_failed:
+        emit_status("트래커 실패 / 재탐색 필요", "tracking_failed")
+
+    publish_jpeg(frame)
+
+
+def rtsp_capture_worker(rtsp_url: str, stop_event: threading.Event, generation: int) -> None:
+    shared_frame: dict[str, Any] = {"frame": None, "seq": 0, "time": 0.0}
+    frame_lock = threading.RLock()
+    frame_condition = threading.Condition(frame_lock)
+    reader_thread = threading.Thread(
+        target=rtsp_reader_worker,
+        args=(rtsp_url, stop_event, generation, frame_condition, shared_frame),
+        daemon=True,
+    )
+    reader_thread.start()
+
+    last_seq = 0
+    last_publish_at = 0.0
+    while not stop_event.is_set():
+        with settings_lock:
+            fps = max(1, int(settings["capture_fps"]))
+        min_interval = 1.0 / fps
+
+        with frame_condition:
+            if shared_frame["seq"] == last_seq:
+                frame_condition.wait(timeout=0.1)
+            if shared_frame["frame"] is None or shared_frame["seq"] == last_seq:
+                continue
+
+            now = time.time()
+            if now - last_publish_at < min_interval:
+                last_seq = shared_frame["seq"]
+                continue
+
+            frame = shared_frame["frame"].copy()
+            last_seq = shared_frame["seq"]
+
+        process_stream_frame(frame)
+        last_publish_at = time.time()
+
+    stop_event.set()
+    reader_thread.join(timeout=1.0)
+    with frame_condition:
+        frame_condition.notify_all()
     with stream_lock:
         if generation == stream_state["generation"]:
             stream_state["running"] = False
@@ -838,6 +917,7 @@ def start_stream() -> str:
         if previous_stop is not None:
             previous_stop.set()
 
+        clear_latest_video()
         stream_state["generation"] += 1
         generation = stream_state["generation"]
         stop_event = threading.Event()
@@ -866,6 +946,7 @@ def stop_stream() -> None:
             stop_event.set()
         stream_state["running"] = False
         stream_state["stop_event"] = None
+    clear_latest_video()
     stop_tracking_state("idle", "stream stopped")
 
 
@@ -1058,14 +1139,25 @@ def start_tracking_and_wait(prompt: str) -> dict[str, Any]:
 
 
 def mjpeg_generator():
+    last_seq = -1
     while True:
-        with jpeg_lock:
+        with jpeg_condition:
+            jpeg_condition.wait_for(
+                lambda: latest_jpeg is not None and latest_jpeg_seq != last_seq,
+                timeout=1.0,
+            )
             data = latest_jpeg
-        if data is None:
-            time.sleep(0.05)
+            seq = latest_jpeg_seq
+        if data is None or seq == last_seq:
             continue
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
-        time.sleep(1 / 30)
+        last_seq = seq
+        header = (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            + f"Content-Length: {len(data)}\r\n".encode("ascii")
+            + b"Cache-Control: no-cache, no-store, must-revalidate\r\n\r\n"
+        )
+        yield header + data + b"\r\n"
 
 
 @app.get("/")
@@ -1082,6 +1174,11 @@ def video_feed():
     return StreamingResponse(
         mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
