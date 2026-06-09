@@ -153,7 +153,7 @@ class TensorRTQwenVL:
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": 1,
-            "max_generate_length": 256,
+            "max_generate_length": 1024,
             "requests": [
                 {
                     "messages": [
@@ -322,7 +322,7 @@ class TensorRTQwenVL:
 
     def _extract_answer_json(self, data: Any) -> dict[str, Any] | None:
         if isinstance(data, dict):
-            if "found" in data:
+            if "found" in data or "objects" in data:
                 return data
             for key, value in data.items():
                 if key in {"input", "request", "requests", "prompt"}:

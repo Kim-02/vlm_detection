@@ -327,7 +327,7 @@
         <div class="k">스타트업 테스트</div><div class="v" id="startupStatus">pending</div>
         <div class="k">스트림</div><div class="v" id="streamStatus">대기</div>
         <div class="k">추적</div><div class="v" id="trackingStatus">대기</div>
-        <div class="k">BBox</div><div class="v" id="bboxStatus">-</div>
+        <div class="k">Targets</div><div class="v" id="bboxStatus">-</div>
         <div class="k">검증</div><div class="v" id="verifyStatus">-</div>
         <div class="k">프롬프트</div><div class="v" id="promptStatus">-</div>
       </div>
@@ -360,7 +360,11 @@
       </div>
       <div class="field">
         <label for="captureFps">Capture FPS</label>
-        <input id="captureFps" type="number" min="1" max="60" value="{{ settings.capture_fps }}">
+        <input id="captureFps" type="number" min="1" max="120" value="{{ settings.capture_fps }}">
+      </div>
+      <div class="field">
+        <label for="maxTargets">Max Targets</label>
+        <input id="maxTargets" type="number" min="1" max="12" value="{{ settings.max_targets }}">
       </div>
       <div class="field">
         <label for="verifyInterval">Verify Interval Sec</label>
@@ -396,7 +400,8 @@
         engine_path: document.getElementById('enginePath').value.trim(),
         llm_inference_bin: document.getElementById('llmInferenceBin').value.trim(),
         plugin_path: document.getElementById('pluginPath').value.trim(),
-        capture_fps: Number(document.getElementById('captureFps').value) || 10,
+        capture_fps: Number(document.getElementById('captureFps').value) || 30,
+        max_targets: Number(document.getElementById('maxTargets').value) || 12,
         verify_interval_sec: Number(document.getElementById('verifyInterval').value) || 3,
         jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80,
         startup_test_prompt: document.getElementById('startupPrompt').value.trim()
@@ -500,7 +505,7 @@
     function stateClass(text, state) {
       text.className = 'v';
       if (state === 'ready' || state === 'success' || state === 'running' || state === 'tracking' || state === true) text.classList.add('good');
-      if (state === 'loading' || state === 'pending' || state === 'locating' || state === 'verifying') text.classList.add('warn');
+      if (state === 'loading' || state === 'pending' || state === 'locating' || state === 'searching' || state === 'detecting' || state === 'verifying') text.classList.add('warn');
       if (state === 'failed' || state === 'verify_failed' || state === 'lost' || state === 'error' || state === false) text.classList.add('bad');
     }
 
@@ -539,16 +544,20 @@
       const labels = {
         idle: '대기',
         locating: '대상 검색 중',
-        tracking: status.tracking && status.tracking.verifying ? '추적 중 / 검증 중' : '추적 중',
+        searching: status.tracking && status.tracking.detecting ? '최신 화면 탐색 중' : '대상 탐색 중',
+        tracking: status.tracking && status.tracking.detecting ? '추적 중 / 최신 화면 분석 중' : '추적 중',
         not_found: '대상 없음',
         verify_failed: '검증 실패 / 재탐색 필요',
         lost: '트래커 실패 / 재탐색 필요',
         error: '오류'
       };
       trackingEl.textContent = labels[state] || state;
-      stateClass(trackingEl, status.tracking && status.tracking.verifying ? 'verifying' : state);
+      stateClass(trackingEl, status.tracking && status.tracking.detecting ? 'detecting' : state);
 
-      bboxEl.textContent = status.bbox ? `[${status.bbox.join(', ')}]` : '-';
+      const targets = status.targets || [];
+      bboxEl.textContent = targets.length
+        ? `${targets.length}개 · ${targets.map(t => `#${t.id}(${(t.point || []).join(',')})`).join(' ')}`
+        : '-';
       promptEl.textContent = status.current_prompt || '-';
 
       const verify = status.last_verify_result || {};

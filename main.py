@@ -43,7 +43,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "engine_path": "/media/ds/DATA/engines/qwen25-vl-7b-4k-12batch",
     "llm_inference_bin": "/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
     "plugin_path": "",
-    "capture_fps": 10,
+    "capture_fps": 30,
+    "max_targets": 12,
     "verify_interval_sec": 3,
     "jpeg_quality": 80,
     "startup_test_prompt": "이미지에 사람이 있는지 확인하고 있으면 bbox를 JSON으로 반환해줘.",
@@ -75,12 +76,14 @@ stream_state: dict[str, Any] = {
 }
 
 tracking_lock = threading.RLock()
-tracker = None
+trackers: dict[int, Any] = {}
+next_target_id = 1
 tracking_state: dict[str, Any] = {
     "active": False,
     "status": "idle",
     "prompt": "",
     "bbox": None,
+    "targets": [],
     "label": "",
     "confidence": None,
     "last_verify_result": {
@@ -92,6 +95,7 @@ tracking_state: dict[str, Any] = {
     },
     "last_verify_at": 0.0,
     "locating": False,
+    "detecting": False,
     "verifying": False,
     "request_id": 0,
 }
@@ -129,9 +133,15 @@ def coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
 
     if "capture_fps" in cleaned:
         try:
-            cleaned["capture_fps"] = max(1, min(60, int(float(cleaned["capture_fps"]))))
+            cleaned["capture_fps"] = max(1, min(120, int(float(cleaned["capture_fps"]))))
         except (TypeError, ValueError):
             cleaned["capture_fps"] = DEFAULT_SETTINGS["capture_fps"]
+
+    if "max_targets" in cleaned:
+        try:
+            cleaned["max_targets"] = max(1, min(12, int(float(cleaned["max_targets"]))))
+        except (TypeError, ValueError):
+            cleaned["max_targets"] = DEFAULT_SETTINGS["max_targets"]
 
     if "verify_interval_sec" in cleaned:
         try:
@@ -434,6 +444,34 @@ def bbox_prompt(user_prompt: str) -> str:
 설명 문장은 출력하지 마라."""
 
 
+def multi_target_prompt(user_prompt: str, max_targets: int) -> str:
+    return f"""현재 CCTV 이미지에서 다음 조건에 해당하는 모든 대상을 찾아라.
+
+조건:
+"{user_prompt}"
+
+최대 {max_targets}개까지만 반환하라.
+각 대상은 화면에 표시할 중심점 point와 tracker 초기화에 사용할 대략적인 bbox를 포함해야 한다.
+
+반드시 아래 JSON 형식으로만 답하라.
+대상이 없으면 found=false, objects=[]로 답하라.
+
+{{
+  "found": true,
+  "objects": [
+    {{
+      "label": "target description",
+      "point": [cx, cy],
+      "bbox": [x1, y1, x2, y2],
+      "confidence": 0.0
+    }}
+  ]
+}}
+
+좌표는 원본 이미지 기준 pixel 좌표다.
+설명 문장은 출력하지 마라."""
+
+
 def verify_prompt(current_prompt: str) -> str:
     return f"""현재 추적 중인 대상이 이미지 안에 아직 존재하는지 확인해라.
 조건:
@@ -545,6 +583,78 @@ def xywh_to_xyxy(box: tuple[float, float, float, float], width: int, height: int
     return clamp_bbox_xyxy([x, y, x + w, y + h], width, height)
 
 
+def bbox_center(bbox: list[int]) -> list[int]:
+    x1, y1, x2, y2 = bbox
+    return [int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))]
+
+
+def clamp_point(raw_point: Any, width: int, height: int, fallback_bbox: list[int]) -> list[int]:
+    if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
+        try:
+            x = int(round(max(0, min(width - 1, float(raw_point[0])))))
+            y = int(round(max(0, min(height - 1, float(raw_point[1])))))
+            return [x, y]
+        except (TypeError, ValueError):
+            pass
+    return bbox_center(fallback_bbox)
+
+
+def normalize_vlm_objects(
+    data: dict[str, Any],
+    frame_shape: tuple[int, int, int],
+    max_targets: int,
+) -> list[dict[str, Any]]:
+    height, width = frame_shape[:2]
+    raw_objects = (
+        data.get("objects")
+        or data.get("targets")
+        or data.get("detections")
+        or data.get("items")
+    )
+    if raw_objects is None:
+        if coerce_bool(data.get("found")):
+            raw_objects = [data]
+        else:
+            raw_objects = []
+    if not isinstance(raw_objects, list):
+        raw_objects = []
+
+    objects: list[dict[str, Any]] = []
+    for raw in raw_objects:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            bbox = clamp_bbox_xyxy(raw.get("bbox"), width, height)
+        except (TypeError, ValueError):
+            continue
+        point = clamp_point(raw.get("point"), width, height, bbox)
+        confidence = None
+        try:
+            if raw.get("confidence") is not None:
+                confidence = float(raw.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = None
+        objects.append(
+            {
+                "label": str(raw.get("label") or data.get("label") or "target"),
+                "bbox": bbox,
+                "point": point,
+                "confidence": confidence,
+            }
+        )
+        if len(objects) >= max_targets:
+            break
+    return objects
+
+
+def infer_vlm_objects(frame_bgr, prompt: str, max_targets: int) -> list[dict[str, Any]]:
+    engine = get_ready_engine()
+    with vlm_call_lock:
+        raw_result = engine.infer(frame_bgr, prompt)
+    parsed = parse_engine_result(raw_result)
+    return normalize_vlm_objects(parsed, frame_bgr.shape, max_targets=max_targets)
+
+
 def get_latest_frame_copy():
     with latest_frame_lock:
         if latest_frame is None:
@@ -554,15 +664,22 @@ def get_latest_frame_copy():
 
 def tracking_snapshot() -> dict[str, Any]:
     with tracking_lock:
+        targets = [dict(target) for target in tracking_state["targets"]]
+        first_target = targets[0] if targets else None
         return {
             "active": bool(tracking_state["active"]),
             "status": tracking_state["status"],
             "prompt": tracking_state["prompt"],
-            "bbox": list(tracking_state["bbox"]) if tracking_state["bbox"] else None,
-            "label": tracking_state["label"],
-            "confidence": tracking_state["confidence"],
+            "bbox": list(first_target["bbox"]) if first_target else None,
+            "point": list(first_target["point"]) if first_target else None,
+            "targets": targets,
+            "points": [list(target["point"]) for target in targets],
+            "target_count": len(targets),
+            "label": first_target["label"] if first_target else tracking_state["label"],
+            "confidence": first_target["confidence"] if first_target else tracking_state["confidence"],
             "last_verify_result": dict(tracking_state["last_verify_result"]),
             "locating": bool(tracking_state["locating"]),
+            "detecting": bool(tracking_state["detecting"]),
             "verifying": bool(tracking_state["verifying"]),
         }
 
@@ -585,9 +702,13 @@ def current_status() -> dict[str, Any]:
         "startup_test_result": model["startup_test_result"],
         "stream_status": "running" if stream_running else "stopped",
         "tracking_status": track["status"],
-        "tracking_busy": track["locating"] or track["verifying"],
+        "tracking_busy": track["locating"] or track["detecting"] or track["verifying"],
         "current_prompt": track["prompt"],
         "bbox": track["bbox"],
+        "point": track["point"],
+        "targets": track["targets"],
+        "points": track["points"],
+        "target_count": track["target_count"],
         "label": track["label"],
         "confidence": track["confidence"],
         "last_verify_result": track["last_verify_result"],
@@ -601,6 +722,7 @@ def current_status() -> dict[str, Any]:
             "active": track["active"],
             "state": track["status"],
             "locating": track["locating"],
+            "detecting": track["detecting"],
             "verifying": track["verifying"],
         },
     }
@@ -611,18 +733,20 @@ def emit_status(text: str, event_type: str = "status") -> None:
 
 
 def stop_tracking_state(state: str = "idle", message: str = "tracking stopped") -> None:
-    global tracker
+    global trackers
     with tracking_lock:
         tracking_state["request_id"] += 1
-        tracker = None
+        trackers.clear()
         tracking_state.update(
             {
                 "active": False,
                 "status": state,
                 "bbox": None,
+                "targets": [],
                 "label": "",
                 "confidence": None,
                 "locating": False,
+                "detecting": False,
                 "verifying": False,
                 "last_verify_result": {
                     "found": None,
@@ -635,12 +759,23 @@ def stop_tracking_state(state: str = "idle", message: str = "tracking stopped") 
         )
 
 
-def draw_selected_bbox(frame_bgr):
+def draw_tracking_points(frame_bgr):
     snapshot = tracking_snapshot()
-    bbox = snapshot["bbox"]
-    if snapshot["active"] and bbox:
-        x1, y1, x2, y2 = bbox
-        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 80), 2)
+    if snapshot["active"]:
+        for target in snapshot["targets"]:
+            x, y = target["point"]
+            cv2.circle(frame_bgr, (x, y), 7, (0, 255, 80), -1, cv2.LINE_AA)
+            cv2.circle(frame_bgr, (x, y), 12, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                frame_bgr,
+                str(target["id"]),
+                (x + 10, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 80),
+                2,
+                cv2.LINE_AA,
+            )
     return frame_bgr
 
 
@@ -648,7 +783,7 @@ def publish_jpeg(frame_bgr) -> None:
     global latest_jpeg, latest_jpeg_seq
     with settings_lock:
         quality = int(settings["jpeg_quality"])
-    display = draw_selected_bbox(frame_bgr.copy())
+    display = draw_tracking_points(frame_bgr.copy())
     ok, jpeg = cv2.imencode(
         ".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
     )
@@ -728,7 +863,7 @@ def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
 
 
 def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
-    global tracker
+    global trackers
     found = False
     result: dict[str, Any] | None = None
     message = ""
@@ -754,10 +889,11 @@ def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
         if found:
             tracking_state["status"] = "tracking"
         else:
-            tracker = None
+            trackers.clear()
             tracking_state["active"] = False
             tracking_state["status"] = "verify_failed"
             tracking_state["bbox"] = None
+            tracking_state["targets"] = []
 
     if found:
         emit_status("검증 성공", "verify_result")
@@ -810,50 +946,231 @@ def rtsp_reader_worker(
     cap.release()
 
 
+def new_target_record(
+    target_id: int,
+    detection: dict[str, Any],
+    source: str,
+) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "id": target_id,
+        "label": detection["label"],
+        "bbox": list(detection["bbox"]),
+        "point": list(detection["point"]),
+        "confidence": detection["confidence"],
+        "source": source,
+        "last_seen": now_iso(),
+        "last_seen_ts": now,
+    }
+
+
+def create_tracker_for_bbox(frame, bbox: list[int]):
+    tracker_obj = create_csrt_tracker()
+    init_result = tracker_obj.init(frame, xyxy_to_xywh(bbox))
+    if init_result is False:
+        raise RuntimeError("tracker.init returned false")
+    return tracker_obj
+
+
+def center_distance(point_a: list[int], point_b: list[int]) -> float:
+    return float(((point_a[0] - point_b[0]) ** 2 + (point_a[1] - point_b[1]) ** 2) ** 0.5)
+
+
+def iou_xyxy(box_a: list[int], box_b: list[int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def match_detection_to_target(
+    detection: dict[str, Any],
+    targets: list[dict[str, Any]],
+    used_ids: set[int],
+    frame_shape: tuple[int, int, int],
+) -> int | None:
+    height, width = frame_shape[:2]
+    distance_limit = max(36.0, min(width, height) * 0.08)
+    best_id = None
+    best_score = -1.0
+    for target in targets:
+        target_id = int(target["id"])
+        if target_id in used_ids:
+            continue
+        dist = center_distance(detection["point"], target["point"])
+        overlap = iou_xyxy(detection["bbox"], target["bbox"])
+        if dist > distance_limit and overlap < 0.1:
+            continue
+        score = overlap * 3.0 + max(0.0, 1.0 - (dist / distance_limit))
+        if score > best_score:
+            best_score = score
+            best_id = target_id
+    return best_id
+
+
+def apply_vlm_detections(
+    frame,
+    detections: list[dict[str, Any]],
+    request_id: int,
+) -> None:
+    global next_target_id
+    created = 0
+    updated = 0
+    errors: list[str] = []
+
+    with settings_lock:
+        max_targets = int(settings["max_targets"])
+
+    with tracking_lock:
+        if request_id != tracking_state["request_id"] or not tracking_state["active"]:
+            return
+        existing_targets = [dict(target) for target in tracking_state["targets"]]
+        new_targets = existing_targets[:]
+        used_ids: set[int] = set()
+
+    for detection in detections[:max_targets]:
+        matched_id = match_detection_to_target(
+            detection,
+            existing_targets,
+            used_ids,
+            frame.shape,
+        )
+        try:
+            tracker_obj = create_tracker_for_bbox(frame, detection["bbox"])
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+
+        with tracking_lock:
+            if request_id != tracking_state["request_id"] or not tracking_state["active"]:
+                return
+            if matched_id is None:
+                target_id = next_target_id
+                next_target_id += 1
+                new_targets.append(new_target_record(target_id, detection, "vlm"))
+                created += 1
+            else:
+                target_id = matched_id
+                for index, target in enumerate(new_targets):
+                    if int(target["id"]) == target_id:
+                        new_targets[index] = new_target_record(target_id, detection, "vlm")
+                        updated += 1
+                        break
+            trackers[target_id] = tracker_obj
+            used_ids.add(target_id)
+
+            if len(new_targets) > max_targets:
+                overflow = new_targets[max_targets:]
+                for target in overflow:
+                    trackers.pop(int(target["id"]), None)
+                new_targets = new_targets[:max_targets]
+
+            tracking_state["targets"] = new_targets
+            tracking_state["bbox"] = list(new_targets[0]["bbox"]) if new_targets else None
+            tracking_state["label"] = new_targets[0]["label"] if new_targets else ""
+            tracking_state["confidence"] = new_targets[0]["confidence"] if new_targets else None
+            tracking_state["status"] = "tracking" if new_targets else "searching"
+            tracking_state["locating"] = not bool(new_targets)
+            tracking_state["last_verify_result"] = {
+                "found": bool(detections),
+                "label": f"{len(new_targets)} target(s)",
+                "confidence": None,
+                "message": f"vlm_detected={len(detections)}, updated={updated}, created={created}",
+                "time": now_iso(),
+            }
+
+    with tracking_lock:
+        if request_id != tracking_state["request_id"] or not tracking_state["active"]:
+            return
+        if not detections:
+            tracking_state["status"] = "tracking" if tracking_state["targets"] else "searching"
+            tracking_state["locating"] = not bool(tracking_state["targets"])
+            tracking_state["last_verify_result"] = {
+                "found": False,
+                "label": "",
+                "confidence": None,
+                "message": "vlm_detected=0; latest frame will keep searching",
+                "time": now_iso(),
+            }
+        if errors and not tracking_state["targets"]:
+            tracking_state["last_verify_result"] = {
+                "found": False,
+                "label": "",
+                "confidence": None,
+                "message": f"tracker_init_error: {errors[0]}",
+                "time": now_iso(),
+            }
+
+
 def process_stream_frame(frame) -> None:
-    global tracker
-    current_bbox: list[int] | None = None
+    global trackers
     tracker_failed = False
     with tracking_lock:
-        if tracking_state["active"] and tracker is not None:
-            try:
-                updated, box = tracker.update(frame)
-                if updated:
-                    height, width = frame.shape[:2]
-                    current_bbox = xywh_to_xyxy(box, width, height)
-            except Exception as exc:
+        if tracking_state["active"] and trackers:
+            next_targets: list[dict[str, Any]] = []
+            failed_ids: list[int] = []
+            targets_by_id = {int(target["id"]): target for target in tracking_state["targets"]}
+            tracker_items = list(trackers.items())
+            height, width = frame.shape[:2]
+            for target_id, tracker_obj in tracker_items:
+                target = targets_by_id.get(int(target_id))
+                if target is None:
+                    failed_ids.append(int(target_id))
+                    continue
                 updated = False
+                box = None
+                try:
+                    updated, box = tracker_obj.update(frame)
+                except Exception as exc:
+                    tracking_state["last_verify_result"] = {
+                        "found": False,
+                        "label": "",
+                        "confidence": None,
+                        "message": f"tracker_error: {exc}",
+                        "time": now_iso(),
+                    }
+
+                if updated and box is not None:
+                    bbox = xywh_to_xyxy(box, width, height)
+                    target.update(
+                        {
+                            "bbox": bbox,
+                            "point": bbox_center(bbox),
+                            "source": "tracker",
+                            "last_seen": now_iso(),
+                            "last_seen_ts": time.time(),
+                        }
+                    )
+                    next_targets.append(target)
+                else:
+                    failed_ids.append(int(target_id))
+                    tracker_failed = True
+
+            for target_id in failed_ids:
+                trackers.pop(target_id, None)
+
+            tracking_state["targets"] = next_targets
+            tracking_state["bbox"] = list(next_targets[0]["bbox"]) if next_targets else None
+            tracking_state["label"] = next_targets[0]["label"] if next_targets else ""
+            tracking_state["confidence"] = next_targets[0]["confidence"] if next_targets else None
+            tracking_state["status"] = "tracking" if next_targets else "searching"
+            tracking_state["locating"] = not bool(next_targets)
+            if tracker_failed and not next_targets:
                 tracking_state["last_verify_result"] = {
                     "found": False,
                     "label": "",
                     "confidence": None,
-                    "message": f"tracker_error: {exc}",
+                    "message": "all trackers lost; continuing latest-frame search",
                     "time": now_iso(),
                 }
-
-            if updated:
-                tracking_state["bbox"] = current_bbox
-                tracking_state["status"] = "tracking"
-            else:
-                tracking_state["request_id"] += 1
-                tracker = None
-                tracking_state["active"] = False
-                tracking_state["status"] = "lost"
-                tracking_state["bbox"] = None
-                tracking_state["verifying"] = False
-                tracking_state["last_verify_result"] = {
-                    "found": False,
-                    "label": "",
-                    "confidence": None,
-                    "message": "tracker_update_failed",
-                    "time": now_iso(),
-                }
-                tracker_failed = True
-
-    if current_bbox:
-        maybe_start_verification(frame.copy(), current_bbox)
-    elif tracker_failed:
-        emit_status("트래커 실패 / 재탐색 필요", "tracking_failed")
 
     publish_jpeg(frame)
 
@@ -950,192 +1267,126 @@ def stop_stream() -> None:
     stop_tracking_state("idle", "stream stopped")
 
 
-def prepare_tracking_request(prompt: str) -> tuple[bool, str, Any | None, int | None]:
-    global tracker
+def prepare_tracking_session(prompt: str) -> tuple[bool, str, int | None]:
+    global trackers
     prompt = prompt.strip()
     if not prompt:
-        return False, "prompt is empty", None, None
+        return False, "prompt is empty", None
 
     model = model_snapshot()
     if model["model_status"] != "ready":
-        return False, f"model is not ready: {model['model_status']}", None, None
+        return False, f"model is not ready: {model['model_status']}", None
 
     with stream_lock:
         if not stream_state["running"]:
-            return False, "stream is not running", None, None
-
-    frame = get_latest_frame_copy()
-    if frame is None:
-        return False, "latest frame is not ready", None, None
+            return False, "stream is not running", None
 
     with tracking_lock:
         tracking_state["request_id"] += 1
         request_id = tracking_state["request_id"]
-        tracker = None
+        trackers.clear()
         tracking_state.update(
             {
-                "active": False,
-                "status": "locating",
+                "active": True,
+                "status": "searching",
                 "prompt": prompt,
                 "bbox": None,
+                "targets": [],
                 "label": "",
                 "confidence": None,
                 "locating": True,
+                "detecting": False,
                 "verifying": False,
                 "last_verify_result": {
                     "found": None,
                     "label": "",
                     "confidence": None,
-                    "message": "locating_target",
+                    "message": "continuous_latest_frame_search",
                     "time": now_iso(),
                 },
             }
         )
-    return True, "locating target", frame, request_id
+    return True, "continuous latest-frame search started", request_id
 
 
 def start_tracking(prompt: str) -> tuple[bool, str]:
-    ok, message, frame, request_id = prepare_tracking_request(prompt)
+    ok, message, request_id = prepare_tracking_session(prompt)
     if not ok:
         return False, message
     threading.Thread(
-        target=locate_and_start_tracking,
-        args=(frame, prompt.strip(), request_id),
+        target=continuous_detect_worker,
+        args=(prompt.strip(), request_id),
         daemon=True,
     ).start()
+    emit_status(f"[{now_text()}] 최신 프레임 연속 탐색 시작", "tracking_start")
     return True, message
 
 
-def locate_and_start_tracking(frame_bgr, prompt: str, request_id: int) -> dict[str, Any]:
-    global tracker
-    emit_status(f"[{now_text()}] 대상 검색 중...", "tracking_start")
-    try:
-        result = infer_vlm_json(frame_bgr, bbox_prompt(prompt), require_bbox=True)
-    except Exception as exc:
+def continuous_detect_worker(prompt: str, request_id: int) -> None:
+    while True:
         with tracking_lock:
-            if request_id != tracking_state["request_id"]:
-                return {"ok": False, "status": "stale_request", "message": "stale request"}
-            tracking_state.update(
-                {
-                    "active": False,
-                    "status": "error",
-                    "locating": False,
-                    "bbox": None,
-                    "last_verify_result": {
-                        "found": False,
-                        "label": "",
-                        "confidence": None,
-                        "message": f"target_lookup_error: {exc}",
-                        "time": now_iso(),
-                    },
-                }
-            )
-        emit_status(f"대상 검색 오류: {exc}", "tracking_failed")
-        return {"ok": False, "status": "target_lookup_error", "message": str(exc)}
+            if request_id != tracking_state["request_id"] or not tracking_state["active"]:
+                return
+            tracking_state["detecting"] = True
 
-    if not result["found"]:
-        with tracking_lock:
-            if request_id != tracking_state["request_id"]:
-                return {"ok": False, "status": "stale_request", "message": "stale request"}
-            tracking_state.update(
-                {
-                    "active": False,
-                    "status": "not_found",
-                    "locating": False,
-                    "bbox": None,
-                    "last_verify_result": {
-                        "found": False,
-                        "label": result["label"],
-                        "confidence": result["confidence"],
-                        "message": "target_not_found",
-                        "time": now_iso(),
-                    },
-                }
-            )
-        emit_status("대상을 찾지 못했습니다", "tracking_failed")
-        return {
-            "ok": False,
-            "status": "target_not_found",
-            "bbox": None,
-            "label": result["label"],
-        }
+        frame = get_latest_frame_copy()
+        if frame is None:
+            with tracking_lock:
+                if request_id == tracking_state["request_id"]:
+                    tracking_state["detecting"] = False
+                    tracking_state["locating"] = True
+            time.sleep(0.05)
+            continue
 
-    try:
-        new_tracker = create_csrt_tracker()
-        init_result = new_tracker.init(frame_bgr, xyxy_to_xywh(result["bbox"]))
-        if init_result is False:
-            raise RuntimeError("tracker.init returned false")
-    except Exception as exc:
-        with tracking_lock:
-            if request_id != tracking_state["request_id"]:
-                return {"ok": False, "status": "stale_request", "message": "stale request"}
-            tracking_state.update(
-                {
-                    "active": False,
-                    "status": "error",
-                    "locating": False,
-                    "bbox": None,
-                    "last_verify_result": {
-                        "found": False,
-                        "label": result["label"],
-                        "confidence": result["confidence"],
-                        "message": f"tracker_init_error: {exc}",
-                        "time": now_iso(),
-                    },
-                }
-            )
-        emit_status(f"트래커 시작 오류: {exc}", "tracking_failed")
-        return {"ok": False, "status": "tracker_init_error", "message": str(exc)}
+        with settings_lock:
+            max_targets = int(settings["max_targets"])
 
-    with tracking_lock:
-        if request_id != tracking_state["request_id"]:
-            return {"ok": False, "status": "stale_request", "message": "stale request"}
-        tracker = new_tracker
-        tracking_state.update(
-            {
-                "active": True,
-                "status": "tracking",
-                "bbox": result["bbox"],
-                "label": result["label"],
-                "confidence": result["confidence"],
-                "locating": False,
-                "verifying": False,
-                "last_verify_at": time.time(),
-                "last_verify_result": {
-                    "found": True,
-                    "label": result["label"],
-                    "confidence": result["confidence"],
-                    "message": "target_found",
+        try:
+            prompt_text = multi_target_prompt(prompt, max_targets)
+            detections = infer_vlm_objects(frame, prompt_text, max_targets=max_targets)
+            apply_vlm_detections(frame, detections, request_id)
+            with tracking_lock:
+                if request_id == tracking_state["request_id"]:
+                    tracking_state["detecting"] = False
+            emit_status(
+                f"최신 프레임 탐색: {len(detections)}개 후보",
+                "tracking_update",
+            )
+        except Exception as exc:
+            should_sleep = True
+            with tracking_lock:
+                if request_id != tracking_state["request_id"] or not tracking_state["active"]:
+                    return
+                tracking_state["detecting"] = False
+                tracking_state["locating"] = not bool(tracking_state["targets"])
+                tracking_state["status"] = "tracking" if tracking_state["targets"] else "searching"
+                tracking_state["last_verify_result"] = {
+                    "found": False,
+                    "label": "",
+                    "confidence": None,
+                    "message": f"latest_frame_detect_error: {exc}",
                     "time": now_iso(),
-                },
-            }
-        )
-    emit_status("추적 시작", "tracking_started")
-    return {
-        "ok": True,
-        "status": "tracking_started",
-        "bbox": result["bbox"],
-        "label": result["label"],
-    }
+                }
+            emit_status(f"최신 프레임 탐색 오류: {exc}", "tracking_failed")
+            if should_sleep:
+                time.sleep(0.5)
 
 
 def start_tracking_and_wait(prompt: str) -> dict[str, Any]:
-    ok, message, frame, request_id = prepare_tracking_request(prompt)
+    ok, message, request_id = prepare_tracking_session(prompt)
     if not ok:
         return {"ok": False, "status": "rejected", "message": message}
-
-    done = threading.Event()
-    output: dict[str, Any] = {}
-
-    def worker() -> None:
-        try:
-            output.update(locate_and_start_tracking(frame, prompt.strip(), request_id))
-        finally:
-            done.set()
-
-    threading.Thread(target=worker, daemon=True).start()
-    done.wait()
-    return output
+    threading.Thread(
+        target=continuous_detect_worker,
+        args=(prompt.strip(), request_id),
+        daemon=True,
+    ).start()
+    return {
+        "ok": True,
+        "status": "continuous_search_started",
+        "message": message,
+        "request_id": request_id,
+    }
 
 
 def mjpeg_generator():

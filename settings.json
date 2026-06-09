@@ -3,7 +3,8 @@
   "engine_path": "/media/ds/DATA/engines/qwen25-vl-7b-4k-12batch",
   "llm_inference_bin": "/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
   "plugin_path": "",
-  "capture_fps": 10,
+  "capture_fps": 30,
+  "max_targets": 12,
   "verify_interval_sec": 3,
   "jpeg_quality": 80,
   "startup_test_prompt": "이미지에 사람이 있는지 확인하고 있으면 bbox를 JSON으로 반환해줘."
