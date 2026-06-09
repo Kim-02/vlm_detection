@@ -80,7 +80,7 @@ class TensorRTQwenVL:
     def _resolve_engine_file(self, path: Path) -> Path:
         if path.is_file():
             return path
-        engine_files = sorted(path.glob("*.engine"))
+        engine_files = sorted(path.rglob("*.engine"))
         if not engine_files:
             raise FileNotFoundError(f"no .engine file found under: {path}")
         return engine_files[0]

@@ -294,6 +294,10 @@
         <div class="k">startup_test</div><div class="v" id="loadingStartupStatus">pending</div>
         <div class="k">last_error</div><div class="v bad" id="loadingError">-</div>
       </div>
+      <div class="buttons">
+        <button onclick="reloadModel()">모델 다시 로딩</button>
+        <button class="secondary" onclick="saveSettings()">설정 저장 후 로딩</button>
+      </div>
     </div>
   </div>
 
@@ -362,6 +366,7 @@
         <input id="startupPrompt" value="{{ settings.startup_test_prompt }}">
       </div>
       <button class="secondary" onclick="saveSettings()">설정 저장</button>
+      <button class="secondary" onclick="reloadModel()" style="margin-top:8px;width:100%;">모델 다시 로딩</button>
       <div class="save-line" id="saveLine"></div>
     </section>
   </main>
@@ -451,6 +456,11 @@
 
     function saveSettings() {
       send({ type: 'save_settings', ...settingsPayload() });
+    }
+
+    function reloadModel() {
+      send({ type: 'reload_model' });
+      flashSaved('모델 로딩 요청됨');
     }
 
     function flashSaved(text, bad = false) {

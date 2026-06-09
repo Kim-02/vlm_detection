@@ -284,6 +284,19 @@ def start_model_loading(app_obj: FastAPI) -> None:
     emit_status("TensorRT engine loading...", "model_loading")
 
 
+def should_reload_model(reload_requested: bool) -> bool:
+    if reload_requested:
+        return True
+    with model_lock:
+        return getattr(app.state, "model_status", "loading") == "failed"
+
+
+def reload_model(reason: str = "manual reload") -> dict[str, Any]:
+    stop_tracking_state("idle", reason)
+    start_model_loading(app)
+    return {"ok": True, "status": "model_reloading", "reason": reason}
+
+
 def model_loader_worker(
     app_obj: FastAPI,
     generation: int,
@@ -1039,6 +1052,11 @@ def api_status():
     return JSONResponse(current_status())
 
 
+@app.post("/api/model/reload")
+def api_model_reload():
+    return JSONResponse(reload_model("manual REST reload"))
+
+
 @app.post("/api/track/start")
 def api_track_start(payload: TrackStartRequest):
     return JSONResponse(start_tracking_and_wait(payload.prompt))
@@ -1060,16 +1078,18 @@ async def websocket_endpoint(ws: WebSocket):
             action = data.get("action") or data.get("type")
 
             if action == "start_stream":
-                _, reload_model = update_settings_from_payload(data)
-                if reload_model:
-                    stop_tracking_state("idle", "engine settings changed")
-                    start_model_loading(app)
+                _, reload_requested = update_settings_from_payload(data)
+                if should_reload_model(reload_requested):
+                    reload_model_result = reload_model("stream start reload")
+                else:
+                    reload_model_result = None
                 result = start_stream()
                 await ws.send_json(
                     {
                         "type": "stream_started",
                         "text": "● 스트리밍 중",
                         "result": result,
+                        "model_reload": reload_model_result,
                         "status": current_status(),
                     }
                 )
@@ -1101,11 +1121,21 @@ async def websocket_endpoint(ws: WebSocket):
                     }
                 )
 
+            elif action == "reload_model":
+                result = reload_model("manual WebSocket reload")
+                await ws.send_json(
+                    {
+                        "type": "model_reloading",
+                        "text": "TensorRT engine loading...",
+                        "result": result,
+                        "status": current_status(),
+                    }
+                )
+
             elif action == "save_settings":
                 _, engine_changed = update_settings_from_payload(data)
-                if engine_changed:
-                    stop_tracking_state("idle", "engine changed")
-                    start_model_loading(app)
+                if should_reload_model(engine_changed):
+                    reload_model("settings reload")
                 with settings_lock:
                     saved_settings = dict(settings)
                 await ws.send_json(
