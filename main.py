@@ -39,6 +39,8 @@ SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "rtsp_url": "rtsp://admin:password@192.168.0.65:554/stream1",
     "engine_path": "/media/ds/DATA/engines/qwen25-vl-7b-4k-12batch",
+    "llm_inference_bin": "/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
+    "plugin_path": "",
     "capture_fps": 10,
     "verify_interval_sec": 3,
     "jpeg_quality": 80,
@@ -111,7 +113,13 @@ def coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
         if key in data:
             cleaned[key] = data[key]
 
-    for key in ("rtsp_url", "engine_path", "startup_test_prompt"):
+    for key in (
+        "rtsp_url",
+        "engine_path",
+        "llm_inference_bin",
+        "plugin_path",
+        "startup_test_prompt",
+    ):
         if key in cleaned:
             cleaned[key] = str(cleaned[key]).strip()
 
@@ -164,12 +172,19 @@ def update_settings_from_payload(data: dict[str, Any]) -> tuple[dict[str, Any], 
     cleaned = coerce_settings(data)
     with settings_lock:
         old_engine_path = settings["engine_path"]
+        old_llm_inference_bin = settings["llm_inference_bin"]
+        old_plugin_path = settings["plugin_path"]
         old_startup_test_prompt = settings["startup_test_prompt"]
         settings.update(cleaned)
         snapshot = dict(settings)
     save_settings()
     reload_model = (
         bool(cleaned.get("engine_path") and cleaned["engine_path"] != old_engine_path)
+        or bool(
+            cleaned.get("llm_inference_bin")
+            and cleaned["llm_inference_bin"] != old_llm_inference_bin
+        )
+        or bool(cleaned.get("plugin_path") and cleaned["plugin_path"] != old_plugin_path)
         or bool(
             cleaned.get("startup_test_prompt")
             and cleaned["startup_test_prompt"] != old_startup_test_prompt
@@ -230,11 +245,15 @@ app = FastAPI(lifespan=lifespan)
 def init_model_state(app_obj: FastAPI) -> None:
     with settings_lock:
         engine_path = settings["engine_path"]
+        llm_inference_bin = settings["llm_inference_bin"]
+        plugin_path = settings["plugin_path"]
     with model_lock:
         app_obj.state.vlm_engine = None
         app_obj.state.model_status = "loading"
         app_obj.state.startup_test_status = "pending"
         app_obj.state.engine_path = engine_path
+        app_obj.state.llm_inference_bin = llm_inference_bin
+        app_obj.state.plugin_path = plugin_path
         app_obj.state.startup_test_result = None
         app_obj.state.last_error = None
         app_obj.state.model_generation = 0
@@ -249,11 +268,19 @@ def set_model_state(**updates: Any) -> None:
 def model_snapshot() -> dict[str, Any]:
     with settings_lock:
         configured_engine_path = settings["engine_path"]
+        configured_llm_inference_bin = settings["llm_inference_bin"]
+        configured_plugin_path = settings["plugin_path"]
     with model_lock:
         return {
             "model_status": getattr(app.state, "model_status", "loading"),
             "startup_test_status": getattr(app.state, "startup_test_status", "pending"),
             "engine_path": getattr(app.state, "engine_path", configured_engine_path),
+            "llm_inference_bin": getattr(
+                app.state,
+                "llm_inference_bin",
+                configured_llm_inference_bin,
+            ),
+            "plugin_path": getattr(app.state, "plugin_path", configured_plugin_path),
             "startup_test_result": getattr(app.state, "startup_test_result", None),
             "last_error": getattr(app.state, "last_error", None),
         }
@@ -264,6 +291,8 @@ def start_model_loading(app_obj: FastAPI) -> None:
     with settings_lock:
         engine_path = settings["engine_path"]
         startup_test_prompt = settings["startup_test_prompt"]
+        llm_inference_bin = settings["llm_inference_bin"]
+        plugin_path = settings["plugin_path"]
 
     with model_lock:
         generation = getattr(app_obj.state, "model_generation", 0) + 1
@@ -272,12 +301,21 @@ def start_model_loading(app_obj: FastAPI) -> None:
         app_obj.state.model_status = "loading"
         app_obj.state.startup_test_status = "pending"
         app_obj.state.engine_path = engine_path
+        app_obj.state.llm_inference_bin = llm_inference_bin
+        app_obj.state.plugin_path = plugin_path
         app_obj.state.startup_test_result = None
         app_obj.state.last_error = None
 
     model_loader_thread = threading.Thread(
         target=model_loader_worker,
-        args=(app_obj, generation, engine_path, startup_test_prompt),
+        args=(
+            app_obj,
+            generation,
+            engine_path,
+            startup_test_prompt,
+            llm_inference_bin,
+            plugin_path,
+        ),
         daemon=True,
     )
     model_loader_thread.start()
@@ -307,9 +345,15 @@ def model_loader_worker(
     generation: int,
     engine_path: str,
     startup_test_prompt: str,
+    llm_inference_bin: str,
+    plugin_path: str,
 ) -> None:
     try:
-        engine = TensorRTQwenVL(engine_path)
+        engine = TensorRTQwenVL(
+            engine_path,
+            llm_inference_bin=llm_inference_bin,
+            plugin_path=plugin_path,
+        )
         test_frame = get_latest_frame_copy()
         if test_frame is None:
             test_frame = create_startup_test_image()
@@ -532,6 +576,8 @@ def current_status() -> dict[str, Any]:
         "model_status": model["model_status"],
         "startup_test_status": model["startup_test_status"],
         "engine_path": model["engine_path"],
+        "llm_inference_bin": model["llm_inference_bin"],
+        "plugin_path": model["plugin_path"],
         "startup_test_result": model["startup_test_result"],
         "stream_status": "running" if stream_running else "stopped",
         "tracking_status": track["status"],

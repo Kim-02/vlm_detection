@@ -24,8 +24,15 @@ from PIL import Image
 
 
 class TensorRTQwenVL:
-    def __init__(self, engine_path: str):
+    def __init__(
+        self,
+        engine_path: str,
+        llm_inference_bin: str | None = None,
+        plugin_path: str | None = None,
+    ):
         self.engine_path = str(engine_path)
+        self.configured_llm_inference_bin = llm_inference_bin or ""
+        self.configured_plugin_path = plugin_path or ""
         self.engine_dir: Path | None = None
         self.multimodal_engine_dir: Path | None = None
         self.llm_inference_bin: Path | None = None
@@ -210,6 +217,10 @@ class TensorRTQwenVL:
         )
 
     def _resolve_llm_inference_bin(self) -> Path:
+        configured_path = self._usable_path_value(self.configured_llm_inference_bin)
+        if configured_path:
+            return self._require_file(configured_path, "llm_inference_bin")
+
         env_path = self._usable_env_path("EDGELLM_LLM_INFERENCE_BIN")
         if env_path:
             return self._require_file(env_path, "EDGELLM_LLM_INFERENCE_BIN")
@@ -219,6 +230,7 @@ class TensorRTQwenVL:
             return Path(path_hit)
 
         candidates = [
+            "/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
             "~/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
             "~/TensorRT-Edge-LLM/cpp/build/examples/llm/llm_inference",
             "~/TensorRT-Edge-LLM/build/bin/llm_inference",
@@ -235,11 +247,17 @@ class TensorRTQwenVL:
         )
 
     def _resolve_plugin_path(self) -> Path | None:
+        configured_path = self._usable_path_value(self.configured_plugin_path)
+        if configured_path:
+            return self._require_file(configured_path, "plugin_path")
+
         env_path = self._usable_env_path("EDGELLM_PLUGIN_PATH")
         if env_path:
             return self._require_file(env_path, "EDGELLM_PLUGIN_PATH")
 
         candidates = [
+            "/home/ds/edge_llm/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so",
+            "/home/ds/edge_llm/TensorRT-Edge-LLM/build/lib/libNvInfer_edgellm_plugin.so",
             "~/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so",
             "~/TensorRT-Edge-LLM/build/lib/libNvInfer_edgellm_plugin.so",
             "~/TensorRT-Edge-LLM/cpp/build/libNvInfer_edgellm_plugin.so",
@@ -253,6 +271,9 @@ class TensorRTQwenVL:
 
     def _usable_env_path(self, name: str) -> Path | None:
         value = os.environ.get(name, "").strip()
+        return self._usable_path_value(value)
+
+    def _usable_path_value(self, value: str) -> Path | None:
         if not value or self._looks_like_placeholder(value):
             return None
         return Path(value).expanduser()

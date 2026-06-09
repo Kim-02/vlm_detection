@@ -1,6 +1,8 @@
 {
   "rtsp_url": "rtsp://admin:password@192.168.0.65:554/stream1",
   "engine_path": "/media/ds/DATA/engines/qwen25-vl-7b-4k-12batch",
+  "llm_inference_bin": "/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference",
+  "plugin_path": "",
   "capture_fps": 10,
   "verify_interval_sec": 3,
   "jpeg_quality": 80,

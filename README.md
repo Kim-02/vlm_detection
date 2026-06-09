@@ -16,6 +16,12 @@ export EDGELLM_LLM_INFERENCE_BIN=/path/to/llm_inference
 export EDGELLM_PLUGIN_PATH=/path/to/libNvInfer_edgellm_plugin.so
 ```
 
+On the Jetson used for this project, `settings.json` defaults to:
+
+```text
+/home/ds/edge_llm/TensorRT-Edge-LLM/build/examples/llm/llm_inference
+```
+
 `engine_path`가 LLM engine 디렉터리라면 visual engine은 다음 위치를 자동으로 찾습니다.
 
 ```text

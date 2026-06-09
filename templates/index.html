@@ -290,6 +290,7 @@
       <div class="loading-sub">TensorRT engine loading...</div>
       <div class="status-grid">
         <div class="k">engine_path</div><div class="v mono" id="loadingEnginePath">{{ settings.engine_path }}</div>
+        <div class="k">llm_inference</div><div class="v mono" id="loadingLlmInference">{{ settings.llm_inference_bin }}</div>
         <div class="k">model_status</div><div class="v" id="loadingModelStatus">loading</div>
         <div class="k">startup_test</div><div class="v" id="loadingStartupStatus">pending</div>
         <div class="k">last_error</div><div class="v bad" id="loadingError">-</div>
@@ -350,6 +351,14 @@
         <input id="enginePath" value="{{ settings.engine_path }}">
       </div>
       <div class="field">
+        <label for="llmInferenceBin">llm_inference</label>
+        <input id="llmInferenceBin" value="{{ settings.llm_inference_bin }}">
+      </div>
+      <div class="field">
+        <label for="pluginPath">Plugin Path</label>
+        <input id="pluginPath" value="{{ settings.plugin_path }}">
+      </div>
+      <div class="field">
         <label for="captureFps">Capture FPS</label>
         <input id="captureFps" type="number" min="1" max="60" value="{{ settings.capture_fps }}">
       </div>
@@ -385,6 +394,8 @@
       return {
         rtsp_url: document.getElementById('rtspUrl').value.trim(),
         engine_path: document.getElementById('enginePath').value.trim(),
+        llm_inference_bin: document.getElementById('llmInferenceBin').value.trim(),
+        plugin_path: document.getElementById('pluginPath').value.trim(),
         capture_fps: Number(document.getElementById('captureFps').value) || 10,
         verify_interval_sec: Number(document.getElementById('verifyInterval').value) || 3,
         jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80,
@@ -499,6 +510,7 @@
       appPanel.style.display = ready ? 'flex' : 'none';
 
       document.getElementById('loadingEnginePath').textContent = status.engine_path || '-';
+      document.getElementById('loadingLlmInference').textContent = status.llm_inference_bin || '-';
       document.getElementById('loadingModelStatus').textContent = status.model_status || '-';
       document.getElementById('loadingStartupStatus').textContent = status.startup_test_status || '-';
       document.getElementById('loadingError').textContent = status.last_error || '-';
