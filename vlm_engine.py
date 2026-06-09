@@ -129,8 +129,19 @@ class TensorRTQwenVL:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return self._clean_output(raw)
-        return self._clean_output(self._extract_text(parsed))
+            output_text = self._clean_output(raw)
+        else:
+            output_text = self._clean_output(self._extract_text(parsed))
+
+        if not output_text:
+            raise RuntimeError(
+                "TensorRT-Edge-LLM returned no generated text\n"
+                f"cmd={' '.join(cmd)}\n"
+                f"raw_output=\n{self._clip(raw)}\n"
+                f"stdout=\n{self._clip(result.stdout)}\n"
+                f"stderr=\n{self._clip(result.stderr)}"
+            )
+        return output_text
 
     def _build_input_payload(self, image_path: str, prompt: str) -> dict[str, Any]:
         return {
@@ -318,17 +329,32 @@ class TensorRTQwenVL:
     def _clean_output(self, text: str) -> str:
         return str(text).replace("Assistant:", "").replace("User:", "").strip()
 
+    def _clip(self, value: Any, limit: int = 1600) -> str:
+        text = "" if value is None else str(value)
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}... <truncated {len(text) - limit} chars>"
+
     def _parse_json(self, text: str) -> dict[str, Any]:
         cleaned = str(text).strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].strip()
+        if not cleaned:
+            raise ValueError("Model output was empty; expected bbox JSON")
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             start = cleaned.find("{")
             end = cleaned.rfind("}")
             if start == -1 or end == -1 or end <= start:
-                raise
-            return json.loads(cleaned[start : end + 1])
+                raise ValueError(
+                    f"Model output was not valid JSON: {self._clip(cleaned)}"
+                ) from exc
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError as inner_exc:
+                raise ValueError(
+                    f"Model output contained malformed JSON: {self._clip(cleaned)}"
+                ) from inner_exc

@@ -359,7 +359,7 @@ def model_loader_worker(
             test_frame = create_startup_test_image()
 
         with vlm_call_lock:
-            raw_result = engine.infer(test_frame, startup_test_prompt)
+            raw_result = engine.infer(test_frame, bbox_prompt(startup_test_prompt))
         parsed = parse_engine_result(raw_result)
         if "found" not in parsed:
             raise ValueError("startup test result does not contain found field")
