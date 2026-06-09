@@ -1,0 +1,9 @@
+{
+  "model_path": "/media/ds/DATA/models/Qwen2.5-VL-3B",
+  "vllm_url": "http://localhost:1111/v1",
+  "api_key": "test-key",
+  "rtsp_url": "rtsp://username:password@camera-ip:554/stream1",
+  "capture_fps": 30,
+  "verify_interval_sec": 3,
+  "jpeg_quality": 80
+}

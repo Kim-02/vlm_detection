@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt Target Tracker</title>
+  <style>
+    :root {
+      --bg: #050705;
+      --panel: rgba(8, 12, 10, 0.88);
+      --line: rgba(116, 190, 105, 0.28);
+      --text: #e7f0e5;
+      --muted: #8ba08c;
+      --accent: #70c653;
+      --warn: #f1b84b;
+      --bad: #ff6a55;
+      --ok: #78e08f;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    .stage {
+      position: fixed;
+      inset: 0;
+      background: #050705;
+    }
+
+    #videoFeed {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: none;
+    }
+
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(231, 240, 229, 0.34);
+      letter-spacing: 0.16em;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .live {
+      position: fixed;
+      left: 18px;
+      top: 18px;
+      display: none;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid rgba(255, 106, 85, 0.55);
+      background: rgba(0, 0, 0, 0.62);
+      color: #ff6a55;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+    }
+
+    .live.on { display: flex; }
+    .live-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #ff6a55;
+      animation: blink 1s step-end infinite;
+    }
+    @keyframes blink { 50% { opacity: 0.25; } }
+
+    .panel {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      bottom: 16px;
+      width: min(420px, calc(100vw - 32px));
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 5;
+    }
+
+    .box {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      backdrop-filter: blur(18px);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    .section {
+      padding: 13px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .title {
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .state {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    textarea, input {
+      width: 100%;
+      border: 1px solid rgba(116, 190, 105, 0.20);
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.30);
+      color: var(--text);
+      outline: none;
+      font: inherit;
+    }
+
+    textarea:focus, input:focus {
+      border-color: rgba(116, 190, 105, 0.70);
+    }
+
+    textarea {
+      min-height: 84px;
+      resize: vertical;
+      padding: 10px;
+      line-height: 1.45;
+    }
+
+    input {
+      padding: 8px 9px;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 12px;
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 4px;
+      padding: 9px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      color: #071006;
+      background: var(--accent);
+    }
+
+    button.secondary {
+      background: rgba(116, 190, 105, 0.12);
+      border: 1px solid rgba(116, 190, 105, 0.25);
+      color: var(--text);
+    }
+
+    button.danger {
+      background: rgba(255, 106, 85, 0.92);
+      color: #160503;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: 112px 1fr;
+      gap: 8px 10px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .status-grid .k {
+      color: var(--muted);
+    }
+
+    .status-grid .v {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .good { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+
+    .settings {
+      overflow: auto;
+      min-height: 0;
+    }
+
+    .field {
+      margin-bottom: 9px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .save-line {
+      min-height: 18px;
+      margin-top: 8px;
+      color: var(--accent);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 760px) {
+      .panel {
+        left: 10px;
+        right: 10px;
+        top: auto;
+        bottom: 10px;
+        width: auto;
+        max-height: 68vh;
+      }
+
+      .settings {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <img id="videoFeed" alt="CCTV MJPEG stream">
+    <div class="placeholder" id="placeholder">CCTV 스트림 대기 중</div>
+  </div>
+
+  <div class="live" id="liveBadge"><span class="live-dot"></span>LIVE</div>
+
+  <main class="panel">
+    <section class="box section">
+      <div class="title-row">
+        <div class="title">Prompt Tracking</div>
+        <div class="state" id="socketState">연결 중</div>
+      </div>
+      <textarea id="promptInput" placeholder="예: 노란 안전모를 쓴 작업자">{{ settings.prompt if settings.prompt is defined else "" }}</textarea>
+      <div class="buttons">
+        <button onclick="startTracking()">찾기/추적 시작</button>
+        <button class="secondary" onclick="stopTracking()">추적 중지</button>
+      </div>
+    </section>
+
+    <section class="box section">
+      <div class="title-row">
+        <div class="title">Status</div>
+        <div class="state" id="clock">--:--:--</div>
+      </div>
+      <div class="status-grid">
+        <div class="k">스트림</div><div class="v" id="streamStatus">대기</div>
+        <div class="k">추적</div><div class="v" id="trackingStatus">대기</div>
+        <div class="k">BBox</div><div class="v" id="bboxStatus">-</div>
+        <div class="k">검증</div><div class="v" id="verifyStatus">-</div>
+        <div class="k">프롬프트</div><div class="v" id="promptStatus">-</div>
+      </div>
+      <div class="buttons">
+        <button onclick="startStream()">START STREAM</button>
+        <button class="danger" onclick="stopStream()">STOP STREAM</button>
+      </div>
+    </section>
+
+    <section class="box section settings">
+      <div class="title-row">
+        <div class="title">Settings</div>
+        <div class="state" id="saveState"></div>
+      </div>
+      <div class="field">
+        <label for="rtspUrl">RTSP URL</label>
+        <input id="rtspUrl" value="{{ settings.rtsp_url }}">
+      </div>
+      <div class="field">
+        <label for="vllmUrl">vLLM URL</label>
+        <input id="vllmUrl" value="{{ settings.vllm_url }}">
+      </div>
+      <div class="field">
+        <label for="modelPath">Model Path</label>
+        <input id="modelPath" value="{{ settings.model_path }}">
+      </div>
+      <div class="field">
+        <label for="apiKey">API Key</label>
+        <input id="apiKey" value="{{ settings.api_key }}">
+      </div>
+      <div class="field">
+        <label for="captureFps">Capture FPS</label>
+        <input id="captureFps" type="number" min="1" max="60" value="{{ settings.capture_fps }}">
+      </div>
+      <div class="field">
+        <label for="verifyInterval">Verify Interval Sec</label>
+        <input id="verifyInterval" type="number" min="1" step="0.5" value="{{ settings.verify_interval_sec }}">
+      </div>
+      <div class="field">
+        <label for="jpegQuality">JPEG Quality</label>
+        <input id="jpegQuality" type="number" min="10" max="100" value="{{ settings.jpeg_quality }}">
+      </div>
+      <button class="secondary" onclick="saveSettings()">설정 저장</button>
+      <div class="save-line" id="saveLine"></div>
+    </section>
+  </main>
+
+  <script>
+    const videoFeed = document.getElementById('videoFeed');
+    const placeholder = document.getElementById('placeholder');
+    const liveBadge = document.getElementById('liveBadge');
+    const socketState = document.getElementById('socketState');
+    const saveLine = document.getElementById('saveLine');
+    let ws;
+
+    function settingsPayload() {
+      return {
+        rtsp_url: document.getElementById('rtspUrl').value.trim(),
+        vllm_url: document.getElementById('vllmUrl').value.trim(),
+        model_path: document.getElementById('modelPath').value.trim(),
+        api_key: document.getElementById('apiKey').value.trim(),
+        capture_fps: Number(document.getElementById('captureFps').value) || 30,
+        verify_interval_sec: Number(document.getElementById('verifyInterval').value) || 3,
+        jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80
+      };
+    }
+
+    function connectWs() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.onopen = () => {
+        socketState.textContent = '연결됨';
+        send({ action: 'get_status' });
+      };
+      ws.onclose = () => {
+        socketState.textContent = '재연결 중';
+        setTimeout(connectWs, 1000);
+      };
+      ws.onmessage = ({ data }) => {
+        const event = JSON.parse(data);
+        if (event.status) renderStatus(event.status);
+        if (event.type === 'settings_saved') flashSaved('저장됨');
+        if (event.type === 'verify_failed') flashSaved('검증 실패 / 재탐색 필요', true);
+      };
+    }
+
+    function send(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(obj));
+      }
+    }
+
+    function streamImageOn() {
+      videoFeed.src = `/video_feed?t=${Date.now()}`;
+      videoFeed.style.display = 'block';
+      placeholder.style.display = 'none';
+      liveBadge.classList.add('on');
+    }
+
+    function streamImageOff() {
+      videoFeed.removeAttribute('src');
+      videoFeed.style.display = 'none';
+      placeholder.style.display = 'flex';
+      liveBadge.classList.remove('on');
+    }
+
+    function startStream() {
+      send({ action: 'start_stream', ...settingsPayload() });
+      streamImageOn();
+    }
+
+    function stopStream() {
+      send({ action: 'stop_stream' });
+      streamImageOff();
+    }
+
+    function startTracking() {
+      const prompt = document.getElementById('promptInput').value.trim();
+      if (!prompt) {
+        flashSaved('프롬프트를 입력하세요', true);
+        return;
+      }
+      send({ action: 'start_tracking', prompt });
+    }
+
+    function stopTracking() {
+      send({ action: 'stop_tracking' });
+    }
+
+    function saveSettings() {
+      send({ action: 'save_settings', ...settingsPayload() });
+    }
+
+    function flashSaved(text, bad = false) {
+      saveLine.textContent = text;
+      saveLine.className = bad ? 'save-line bad' : 'save-line';
+      clearTimeout(saveLine._t);
+      saveLine._t = setTimeout(() => { saveLine.textContent = ''; }, 2400);
+    }
+
+    function stateClass(text, state) {
+      text.className = 'v';
+      if (state === 'tracking' || state === true) text.classList.add('good');
+      if (state === 'locating' || state === 'verifying') text.classList.add('warn');
+      if (state === 'verify_failed' || state === 'lost' || state === 'error' || state === false) text.classList.add('bad');
+    }
+
+    function renderStatus(status) {
+      const streamEl = document.getElementById('streamStatus');
+      const trackingEl = document.getElementById('trackingStatus');
+      const bboxEl = document.getElementById('bboxStatus');
+      const verifyEl = document.getElementById('verifyStatus');
+      const promptEl = document.getElementById('promptStatus');
+
+      streamEl.textContent = status.stream.running ? '스트리밍 중' : '중지됨';
+      stateClass(streamEl, status.stream.running);
+      if (status.stream.running && !videoFeed.src) streamImageOn();
+      if (!status.stream.running && videoFeed.src) streamImageOff();
+
+      const state = status.tracking.state || 'idle';
+      const labels = {
+        idle: '대기',
+        locating: '대상 검색 중',
+        tracking: status.tracking.verifying ? '추적 중 / 검증 중' : '추적 중',
+        not_found: '대상 없음',
+        verify_failed: '검증 실패 / 재탐색 필요',
+        lost: '트래커 실패 / 재탐색 필요',
+        error: '오류'
+      };
+      trackingEl.textContent = labels[state] || state;
+      stateClass(trackingEl, status.tracking.verifying ? 'verifying' : state);
+
+      bboxEl.textContent = status.bbox ? `[${status.bbox.join(', ')}]` : '-';
+      promptEl.textContent = status.prompt || '-';
+
+      const verify = status.last_verify_result || {};
+      verifyEl.textContent = verify.message ? `${verify.ok === true ? '성공' : verify.ok === false ? '실패' : '-'} · ${verify.message}` : '-';
+      stateClass(verifyEl, verify.ok);
+    }
+
+    setInterval(() => {
+      document.getElementById('clock').textContent = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+    }, 500);
+    setInterval(() => send({ action: 'get_status' }), 2000);
+
+    connectWs();
+    renderStatus({{ status | tojson }});
+  </script>
+</body>
+</html>
