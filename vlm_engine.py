@@ -131,7 +131,11 @@ class TensorRTQwenVL:
         except json.JSONDecodeError:
             output_text = self._clean_output(raw)
         else:
-            output_text = self._clean_output(self._extract_text(parsed))
+            answer_json = self._extract_answer_json(parsed)
+            if answer_json is not None:
+                output_text = json.dumps(answer_json, ensure_ascii=False)
+            else:
+                output_text = self._clean_output(self._extract_text(parsed))
 
         if not output_text:
             raise RuntimeError(
@@ -310,21 +314,144 @@ class TensorRTQwenVL:
         return path
 
     def _extract_text(self, data: Any) -> str:
-        if isinstance(data, str):
-            return data.strip()
-        if isinstance(data, dict):
-            for key in ("text", "content", "output_text", "generated_text", "response", "message"):
-                if key in data:
-                    text = self._extract_text(data[key])
-                    if text:
-                        return text
-            for value in data.values():
-                text = self._extract_text(value)
-                if text:
-                    return text
-        if isinstance(data, list):
-            return "\n".join(filter(None, (self._extract_text(item) for item in data))).strip()
+        for candidate in self._iter_generated_text_candidates(data):
+            text = self._clean_output(candidate)
+            if self._is_generated_text_candidate(text):
+                return text
         return ""
+
+    def _extract_answer_json(self, data: Any) -> dict[str, Any] | None:
+        if isinstance(data, dict):
+            if "found" in data:
+                return data
+            for key, value in data.items():
+                if key in {"input", "request", "requests", "prompt"}:
+                    continue
+                found = self._extract_answer_json(value)
+                if found is not None:
+                    return found
+        if isinstance(data, list):
+            for item in data:
+                found = self._extract_answer_json(item)
+                if found is not None:
+                    return found
+        return None
+
+    def _iter_generated_text_candidates(
+        self,
+        data: Any,
+        response_context: bool = False,
+    ):
+        if isinstance(data, str):
+            if response_context or self._looks_like_json_text(data):
+                yield data
+            return
+
+        if isinstance(data, list):
+            for item in data:
+                yield from self._iter_generated_text_candidates(item, response_context)
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        role = str(data.get("role") or "").strip().lower()
+        content_type = str(data.get("type") or "").strip().lower()
+        if role in {"system", "user"}:
+            return
+        if content_type in {"image", "text"} and not response_context:
+            return
+
+        if role in {"assistant", "model"}:
+            response_context = True
+
+        response_keys = (
+            "output_text",
+            "generated_text",
+            "generated",
+            "response",
+            "responses",
+            "answer",
+            "answers",
+            "completion",
+            "completions",
+            "prediction",
+            "predictions",
+            "result",
+            "results",
+            "output",
+            "outputs",
+            "choices",
+            "message",
+            "messages",
+            "content",
+            "text",
+        )
+        for key in response_keys:
+            if key in data:
+                yield from self._iter_generated_text_candidates(data[key], True)
+
+        metadata_keys = {
+            "batch_size",
+            "engine_dir",
+            "engineDir",
+            "file",
+            "filename",
+            "image",
+            "image_path",
+            "imagePath",
+            "input",
+            "input_file",
+            "inputFile",
+            "input_path",
+            "inputPath",
+            "multimodalEngineDir",
+            "path",
+            "prompt",
+            "request",
+            "requests",
+            "role",
+            "system_prompt",
+            "type",
+        }
+        for key, value in data.items():
+            if key in response_keys or key in metadata_keys:
+                continue
+            yield from self._iter_generated_text_candidates(value, response_context)
+
+    def _looks_like_json_text(self, text: str) -> bool:
+        cleaned = str(text).strip()
+        return (
+            cleaned.startswith("{")
+            or cleaned.startswith("```")
+            or ('"found"' in cleaned and "{" in cleaned and "}" in cleaned)
+        )
+
+    def _is_generated_text_candidate(self, text: str) -> bool:
+        cleaned = str(text).strip()
+        if not cleaned:
+            return False
+        if self._looks_like_runtime_path(cleaned):
+            return False
+        return True
+
+    def _looks_like_runtime_path(self, text: str) -> bool:
+        cleaned = str(text).strip()
+        if "\n" in cleaned:
+            return False
+        suffixes = (
+            ".json",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".engine",
+            ".safetensors",
+        )
+        if cleaned.startswith(("/", "~/")) and (
+            "/" in cleaned or cleaned.endswith(suffixes)
+        ):
+            return True
+        return cleaned.endswith(("/input.json", "/output.json", "/frame.jpg"))
 
     def _clean_output(self, text: str) -> str:
         return str(text).replace("Assistant:", "").replace("User:", "").strip()
