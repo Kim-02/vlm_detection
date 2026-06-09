@@ -397,7 +397,7 @@
       ws = new WebSocket(`${proto}://${location.host}/ws`);
       ws.onopen = () => {
         socketState.textContent = '연결됨';
-        send({ type: 'get_status' });
+        fetchStatus();
       };
       ws.onclose = () => {
         socketState.textContent = '재연결 중';
@@ -414,6 +414,15 @@
     function send(obj) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(obj));
+      }
+    }
+
+    async function fetchStatus() {
+      try {
+        const resp = await fetch('/api/status', { cache: 'no-store' });
+        if (resp.ok) renderStatus(await resp.json());
+      } catch (_) {
+        socketState.textContent = '상태 확인 실패';
       }
     }
 
@@ -458,9 +467,16 @@
       send({ type: 'save_settings', ...settingsPayload() });
     }
 
-    function reloadModel() {
-      send({ type: 'reload_model' });
+    async function reloadModel() {
       flashSaved('모델 로딩 요청됨');
+      try {
+        const resp = await fetch('/api/model/reload', { method: 'POST' });
+        const data = await resp.json();
+        if (data.app_status) renderStatus(data.app_status);
+        setTimeout(fetchStatus, 700);
+      } catch (_) {
+        send({ type: 'reload_model' });
+      }
     }
 
     function flashSaved(text, bad = false) {
@@ -531,7 +547,7 @@
     setInterval(() => {
       document.getElementById('clock').textContent = new Date().toLocaleTimeString('ko-KR', { hour12: false });
     }, 500);
-    setInterval(() => send({ type: 'get_status' }), 2000);
+    setInterval(fetchStatus, 2000);
 
     connectWs();
     renderStatus({{ status | tojson }});

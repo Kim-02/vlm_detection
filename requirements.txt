@@ -4,6 +4,7 @@ opencv-contrib-python-headless==4.10.0.84
 numpy==1.26.4
 pydantic==2.10.4
 jinja2==3.1.5
+pillow==12.1.1
 
-# TensorRT, pycuda, and cuda-python are Jetson/CUDA/TensorRT-version specific.
-# Install them separately for the target runtime instead of pinning them here.
+# TensorRT-Edge-LLM runtime binaries/plugins are Jetson/CUDA/TensorRT-version specific.
+# Build/install them separately, then set EDGELLM_LLM_INFERENCE_BIN if needed.

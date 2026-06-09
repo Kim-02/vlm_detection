@@ -6,9 +6,31 @@ FastAPI + RTSP MJPEG 화면 + TensorRT Qwen2.5-VL bbox 추론 + OpenCV CSRT trac
 
 1. `settings.json`에서 `engine_path`를 실제 TensorRT engine 경로로 수정합니다.
 2. `settings.json`에서 `rtsp_url`을 CCTV RTSP 주소로 수정합니다.
-3. Jetson/TensorRT 환경에 맞게 TensorRT Python runtime, CUDA Python 또는 pycuda 등 engine 실행에 필요한 시스템 패키지를 설치합니다.
+3. Jetson/TensorRT 환경에 맞게 TensorRT-Edge-LLM 런타임 바이너리와 plugin을 준비합니다.
 
-TensorRT, pycuda, cuda-python은 Jetson/CUDA/TensorRT 버전에 따라 설치 방식이 달라서 `requirements.txt`에 고정하지 않았습니다.
+`vlm_engine.py`는 기본적으로 `~/TensorRT-Edge-LLM/build/examples/llm/llm_inference`를 찾습니다.
+다른 위치에 있으면 환경변수를 지정합니다.
+
+```bash
+export EDGELLM_LLM_INFERENCE_BIN=/path/to/llm_inference
+export EDGELLM_PLUGIN_PATH=/path/to/libNvInfer_edgellm_plugin.so
+```
+
+`engine_path`가 LLM engine 디렉터리라면 visual engine은 다음 위치를 자동으로 찾습니다.
+
+```text
+<engine_path>/visual
+<engine_path>/visual_engine
+<engine_path>/visual_engines
+<engine_path의 상위>/visual_engines/<engine_path 이름>
+```
+
+자동 탐색과 다른 구조라면 아래 환경변수로 직접 지정합니다.
+
+```bash
+export EDGELLM_ENGINE_DIR=/path/to/llm_engine
+export EDGELLM_MULTIMODAL_ENGINE_DIR=/path/to/visual_engine
+```
 
 ## 설치
 

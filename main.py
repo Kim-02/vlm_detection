@@ -294,7 +294,12 @@ def should_reload_model(reload_requested: bool) -> bool:
 def reload_model(reason: str = "manual reload") -> dict[str, Any]:
     stop_tracking_state("idle", reason)
     start_model_loading(app)
-    return {"ok": True, "status": "model_reloading", "reason": reason}
+    return {
+        "ok": True,
+        "status": "model_reloading",
+        "reason": reason,
+        "app_status": current_status(),
+    }
 
 
 def model_loader_worker(
