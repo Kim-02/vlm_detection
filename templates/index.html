@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Prompt Target Tracker</title>
+  <title>TensorRT Prompt Tracker</title>
   <style>
     :root {
       --bg: #050705;
@@ -66,6 +66,7 @@
       font-size: 11px;
       font-weight: 800;
       letter-spacing: 0.14em;
+      z-index: 6;
     }
 
     .live.on { display: flex; }
@@ -78,13 +79,50 @@
     }
     @keyframes blink { 50% { opacity: 0.25; } }
 
+    .loading-screen {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      z-index: 10;
+      background: #050705;
+    }
+
+    .loading-card {
+      width: min(620px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      padding: 24px;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.34);
+    }
+
+    .loading-title {
+      margin-bottom: 10px;
+      color: var(--accent);
+      font-size: 20px;
+      font-weight: 800;
+    }
+
+    .loading-sub {
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .mono {
+      font-family: Consolas, "SFMono-Regular", monospace;
+      overflow-wrap: anywhere;
+    }
+
     .panel {
       position: fixed;
       top: 16px;
       right: 16px;
       bottom: 16px;
       width: min(420px, calc(100vw - 32px));
-      display: flex;
+      display: none;
       flex-direction: column;
       gap: 10px;
       z-index: 5;
@@ -98,9 +136,7 @@
       box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
     }
 
-    .section {
-      padding: 13px;
-    }
+    .section { padding: 13px; }
 
     .title-row {
       display: flex;
@@ -188,16 +224,13 @@
 
     .status-grid {
       display: grid;
-      grid-template-columns: 112px 1fr;
+      grid-template-columns: 128px 1fr;
       gap: 8px 10px;
       font-size: 13px;
       line-height: 1.4;
     }
 
-    .status-grid .k {
-      color: var(--muted);
-    }
-
+    .status-grid .k { color: var(--muted); }
     .status-grid .v {
       min-width: 0;
       overflow-wrap: anywhere;
@@ -212,9 +245,7 @@
       min-height: 0;
     }
 
-    .field {
-      margin-bottom: 9px;
-    }
+    .field { margin-bottom: 9px; }
 
     .field label {
       display: block;
@@ -243,9 +274,7 @@
         max-height: 68vh;
       }
 
-      .settings {
-        display: none;
-      }
+      .settings { display: none; }
     }
   </style>
 </head>
@@ -255,15 +284,28 @@
     <div class="placeholder" id="placeholder">CCTV 스트림 대기 중</div>
   </div>
 
+  <div class="loading-screen" id="loadingScreen">
+    <div class="loading-card">
+      <div class="loading-title" id="loadingTitle">모델을 로딩 중입니다...</div>
+      <div class="loading-sub">TensorRT engine loading...</div>
+      <div class="status-grid">
+        <div class="k">engine_path</div><div class="v mono" id="loadingEnginePath">{{ settings.engine_path }}</div>
+        <div class="k">model_status</div><div class="v" id="loadingModelStatus">loading</div>
+        <div class="k">startup_test</div><div class="v" id="loadingStartupStatus">pending</div>
+        <div class="k">last_error</div><div class="v bad" id="loadingError">-</div>
+      </div>
+    </div>
+  </div>
+
   <div class="live" id="liveBadge"><span class="live-dot"></span>LIVE</div>
 
-  <main class="panel">
+  <main class="panel" id="appPanel">
     <section class="box section">
       <div class="title-row">
         <div class="title">Prompt Tracking</div>
         <div class="state" id="socketState">연결 중</div>
       </div>
-      <textarea id="promptInput" placeholder="예: 노란 안전모를 쓴 작업자">{{ settings.prompt if settings.prompt is defined else "" }}</textarea>
+      <textarea id="promptInput" placeholder="예: 노란 안전모를 쓴 작업자"></textarea>
       <div class="buttons">
         <button onclick="startTracking()">찾기/추적 시작</button>
         <button class="secondary" onclick="stopTracking()">추적 중지</button>
@@ -276,6 +318,8 @@
         <div class="state" id="clock">--:--:--</div>
       </div>
       <div class="status-grid">
+        <div class="k">모델</div><div class="v" id="modelStatus">loading</div>
+        <div class="k">스타트업 테스트</div><div class="v" id="startupStatus">pending</div>
         <div class="k">스트림</div><div class="v" id="streamStatus">대기</div>
         <div class="k">추적</div><div class="v" id="trackingStatus">대기</div>
         <div class="k">BBox</div><div class="v" id="bboxStatus">-</div>
@@ -298,16 +342,8 @@
         <input id="rtspUrl" value="{{ settings.rtsp_url }}">
       </div>
       <div class="field">
-        <label for="vllmUrl">vLLM URL</label>
-        <input id="vllmUrl" value="{{ settings.vllm_url }}">
-      </div>
-      <div class="field">
-        <label for="modelPath">Model Path</label>
-        <input id="modelPath" value="{{ settings.model_path }}">
-      </div>
-      <div class="field">
-        <label for="apiKey">API Key</label>
-        <input id="apiKey" value="{{ settings.api_key }}">
+        <label for="enginePath">Engine Path</label>
+        <input id="enginePath" value="{{ settings.engine_path }}">
       </div>
       <div class="field">
         <label for="captureFps">Capture FPS</label>
@@ -321,6 +357,10 @@
         <label for="jpegQuality">JPEG Quality</label>
         <input id="jpegQuality" type="number" min="10" max="100" value="{{ settings.jpeg_quality }}">
       </div>
+      <div class="field">
+        <label for="startupPrompt">Startup Test Prompt</label>
+        <input id="startupPrompt" value="{{ settings.startup_test_prompt }}">
+      </div>
       <button class="secondary" onclick="saveSettings()">설정 저장</button>
       <div class="save-line" id="saveLine"></div>
     </section>
@@ -332,17 +372,18 @@
     const liveBadge = document.getElementById('liveBadge');
     const socketState = document.getElementById('socketState');
     const saveLine = document.getElementById('saveLine');
+    const loadingScreen = document.getElementById('loadingScreen');
+    const appPanel = document.getElementById('appPanel');
     let ws;
 
     function settingsPayload() {
       return {
         rtsp_url: document.getElementById('rtspUrl').value.trim(),
-        vllm_url: document.getElementById('vllmUrl').value.trim(),
-        model_path: document.getElementById('modelPath').value.trim(),
-        api_key: document.getElementById('apiKey').value.trim(),
-        capture_fps: Number(document.getElementById('captureFps').value) || 30,
+        engine_path: document.getElementById('enginePath').value.trim(),
+        capture_fps: Number(document.getElementById('captureFps').value) || 10,
         verify_interval_sec: Number(document.getElementById('verifyInterval').value) || 3,
-        jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80
+        jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80,
+        startup_test_prompt: document.getElementById('startupPrompt').value.trim()
       };
     }
 
@@ -351,7 +392,7 @@
       ws = new WebSocket(`${proto}://${location.host}/ws`);
       ws.onopen = () => {
         socketState.textContent = '연결됨';
-        send({ action: 'get_status' });
+        send({ type: 'get_status' });
       };
       ws.onclose = () => {
         socketState.textContent = '재연결 중';
@@ -386,12 +427,12 @@
     }
 
     function startStream() {
-      send({ action: 'start_stream', ...settingsPayload() });
+      send({ type: 'start_stream', ...settingsPayload() });
       streamImageOn();
     }
 
     function stopStream() {
-      send({ action: 'stop_stream' });
+      send({ type: 'stop_stream' });
       streamImageOff();
     }
 
@@ -401,15 +442,15 @@
         flashSaved('프롬프트를 입력하세요', true);
         return;
       }
-      send({ action: 'start_tracking', prompt });
+      send({ type: 'start_tracking', prompt });
     }
 
     function stopTracking() {
-      send({ action: 'stop_tracking' });
+      send({ type: 'stop_tracking' });
     }
 
     function saveSettings() {
-      send({ action: 'save_settings', ...settingsPayload() });
+      send({ type: 'save_settings', ...settingsPayload() });
     }
 
     function flashSaved(text, bad = false) {
@@ -421,48 +462,66 @@
 
     function stateClass(text, state) {
       text.className = 'v';
-      if (state === 'tracking' || state === true) text.classList.add('good');
-      if (state === 'locating' || state === 'verifying') text.classList.add('warn');
-      if (state === 'verify_failed' || state === 'lost' || state === 'error' || state === false) text.classList.add('bad');
+      if (state === 'ready' || state === 'success' || state === 'running' || state === 'tracking' || state === true) text.classList.add('good');
+      if (state === 'loading' || state === 'pending' || state === 'locating' || state === 'verifying') text.classList.add('warn');
+      if (state === 'failed' || state === 'verify_failed' || state === 'lost' || state === 'error' || state === false) text.classList.add('bad');
     }
 
     function renderStatus(status) {
+      const ready = status.model_status === 'ready' && status.startup_test_status === 'success';
+      loadingScreen.style.display = ready ? 'none' : 'flex';
+      appPanel.style.display = ready ? 'flex' : 'none';
+
+      document.getElementById('loadingEnginePath').textContent = status.engine_path || '-';
+      document.getElementById('loadingModelStatus').textContent = status.model_status || '-';
+      document.getElementById('loadingStartupStatus').textContent = status.startup_test_status || '-';
+      document.getElementById('loadingError').textContent = status.last_error || '-';
+      document.getElementById('loadingTitle').textContent =
+        status.model_status === 'failed' ? '모델 로딩 실패' : '모델을 로딩 중입니다...';
+
+      const modelEl = document.getElementById('modelStatus');
+      const startupEl = document.getElementById('startupStatus');
       const streamEl = document.getElementById('streamStatus');
       const trackingEl = document.getElementById('trackingStatus');
       const bboxEl = document.getElementById('bboxStatus');
       const verifyEl = document.getElementById('verifyStatus');
       const promptEl = document.getElementById('promptStatus');
 
-      streamEl.textContent = status.stream.running ? '스트리밍 중' : '중지됨';
-      stateClass(streamEl, status.stream.running);
-      if (status.stream.running && !videoFeed.src) streamImageOn();
-      if (!status.stream.running && videoFeed.src) streamImageOff();
+      modelEl.textContent = status.model_status || '-';
+      stateClass(modelEl, status.model_status);
+      startupEl.textContent = status.startup_test_status || '-';
+      stateClass(startupEl, status.startup_test_status);
 
-      const state = status.tracking.state || 'idle';
+      streamEl.textContent = status.stream_status === 'running' ? '스트리밍 중' : '중지됨';
+      stateClass(streamEl, status.stream_status);
+      if (ready && status.stream_status === 'running' && !videoFeed.src) streamImageOn();
+      if (status.stream_status !== 'running' && videoFeed.src) streamImageOff();
+
+      const state = status.tracking_status || 'idle';
       const labels = {
         idle: '대기',
         locating: '대상 검색 중',
-        tracking: status.tracking.verifying ? '추적 중 / 검증 중' : '추적 중',
+        tracking: status.tracking && status.tracking.verifying ? '추적 중 / 검증 중' : '추적 중',
         not_found: '대상 없음',
         verify_failed: '검증 실패 / 재탐색 필요',
         lost: '트래커 실패 / 재탐색 필요',
         error: '오류'
       };
       trackingEl.textContent = labels[state] || state;
-      stateClass(trackingEl, status.tracking.verifying ? 'verifying' : state);
+      stateClass(trackingEl, status.tracking && status.tracking.verifying ? 'verifying' : state);
 
       bboxEl.textContent = status.bbox ? `[${status.bbox.join(', ')}]` : '-';
-      promptEl.textContent = status.prompt || '-';
+      promptEl.textContent = status.current_prompt || '-';
 
       const verify = status.last_verify_result || {};
-      verifyEl.textContent = verify.message ? `${verify.ok === true ? '성공' : verify.ok === false ? '실패' : '-'} · ${verify.message}` : '-';
-      stateClass(verifyEl, verify.ok);
+      verifyEl.textContent = verify.message ? `${verify.found === true ? '성공' : verify.found === false ? '실패' : '-'} · ${verify.message}` : '-';
+      stateClass(verifyEl, verify.found);
     }
 
     setInterval(() => {
       document.getElementById('clock').textContent = new Date().toLocaleTimeString('ko-KR', { hour12: false });
     }, 500);
-    setInterval(() => send({ action: 'get_status' }), 2000);
+    setInterval(() => send({ type: 'get_status' }), 2000);
 
     connectWs();
     renderStatus({{ status | tojson }});

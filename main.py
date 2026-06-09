@@ -3,14 +3,13 @@ RTSP CCTV prompt target tracker.
 
 - FastAPI + native WebSocket
 - MJPEG video stream via /video_feed
-- Qwen2.5-VL bbox lookup in background threads
+- TensorRT Qwen2.5-VL wrapper for bbox lookup and verification
 - OpenCV CSRT tracker for per-frame target tracking
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import re
@@ -21,13 +20,15 @@ from datetime import datetime
 from typing import Any
 
 import cv2
-import requests
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
+from vlm_engine import TensorRTQwenVL
 
 
-# FFMPEG low-latency options must be set before VideoCapture is created.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0"
 )
@@ -36,18 +37,20 @@ templates = Jinja2Templates(directory="templates")
 
 SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "model_path": "/media/ds/DATA/models/Qwen2.5-VL-3B",
-    "vllm_url": "http://localhost:1111/v1",
-    "api_key": "test-key",
-    "rtsp_url": "rtsp://username:password@camera-ip:554/stream1",
-    "capture_fps": 30,
+    "rtsp_url": "rtsp://admin:password@192.168.0.65:554/stream1",
+    "engine_path": "/media/ds/DATA/engines/qwen25-vl-7b-4k-12batch",
+    "capture_fps": 10,
     "verify_interval_sec": 3,
     "jpeg_quality": 80,
+    "startup_test_prompt": "이미지에 사람이 있는지 확인하고 있으면 bbox를 JSON으로 반환해줘.",
 }
 SETTINGS_KEYS = set(DEFAULT_SETTINGS)
 
 settings_lock = threading.RLock()
 settings: dict[str, Any] = dict(DEFAULT_SETTINGS)
+
+model_lock = threading.RLock()
+model_loader_thread: threading.Thread | None = None
 
 latest_frame_lock = threading.RLock()
 latest_frame = None
@@ -69,12 +72,18 @@ tracking_lock = threading.RLock()
 tracker = None
 tracking_state: dict[str, Any] = {
     "active": False,
-    "state": "idle",
+    "status": "idle",
     "prompt": "",
     "bbox": None,
     "label": "",
     "confidence": None,
-    "last_verify_result": {"ok": None, "message": "not_verified", "time": None},
+    "last_verify_result": {
+        "found": None,
+        "label": "",
+        "confidence": None,
+        "message": "not_verified",
+        "time": None,
+    },
     "last_verify_at": 0.0,
     "locating": False,
     "verifying": False,
@@ -82,6 +91,10 @@ tracking_state: dict[str, Any] = {
 }
 
 vlm_call_lock = threading.Lock()
+
+
+class TrackStartRequest(BaseModel):
+    prompt: str
 
 
 def now_text() -> str:
@@ -98,23 +111,7 @@ def coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
         if key in data:
             cleaned[key] = data[key]
 
-    if "model_name" in data and "model_path" not in cleaned:
-        cleaned["model_path"] = data["model_name"]
-
-    if "rtsp_url" not in cleaned:
-        old_keys = ("cam_ip", "cam_port", "cam_user", "cam_pw", "cam_path")
-        if all(k in data for k in old_keys):
-            user = str(data.get("cam_user") or "")
-            password = str(data.get("cam_pw") or "")
-            host = str(data.get("cam_ip") or "")
-            port = str(data.get("cam_port") or "554")
-            path = str(data.get("cam_path") or "")
-            if path and not path.startswith("/"):
-                path = "/" + path
-            cred = f"{user}:{password}@" if user else ""
-            cleaned["rtsp_url"] = f"rtsp://{cred}{host}:{port}{path}"
-
-    for key in ("model_path", "vllm_url", "api_key", "rtsp_url"):
+    for key in ("rtsp_url", "engine_path", "startup_test_prompt"):
         if key in cleaned:
             cleaned[key] = str(cleaned[key]).strip()
 
@@ -163,13 +160,22 @@ def save_settings() -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def update_settings_from_payload(data: dict[str, Any]) -> dict[str, Any]:
+def update_settings_from_payload(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     cleaned = coerce_settings(data)
     with settings_lock:
+        old_engine_path = settings["engine_path"]
+        old_startup_test_prompt = settings["startup_test_prompt"]
         settings.update(cleaned)
         snapshot = dict(settings)
     save_settings()
-    return snapshot
+    reload_model = (
+        bool(cleaned.get("engine_path") and cleaned["engine_path"] != old_engine_path)
+        or bool(
+            cleaned.get("startup_test_prompt")
+            and cleaned["startup_test_prompt"] != old_startup_test_prompt
+        )
+    )
+    return snapshot, reload_model
 
 
 class ConnectionManager:
@@ -209,29 +215,137 @@ manager = ConnectionManager()
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app_obj: FastAPI):
     manager._loop = asyncio.get_running_loop()
     load_settings()
+    init_model_state(app_obj)
+    start_model_loading(app_obj)
     yield
+    stop_stream()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def chat_completions_url(vllm_url: str) -> str:
-    base = vllm_url.rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base
-    return f"{base}/chat/completions"
+def init_model_state(app_obj: FastAPI) -> None:
+    with settings_lock:
+        engine_path = settings["engine_path"]
+    with model_lock:
+        app_obj.state.vlm_engine = None
+        app_obj.state.model_status = "loading"
+        app_obj.state.startup_test_status = "pending"
+        app_obj.state.engine_path = engine_path
+        app_obj.state.startup_test_result = None
+        app_obj.state.last_error = None
+        app_obj.state.model_generation = 0
 
 
-def encode_frame_base64(frame_bgr, quality: int = 90) -> str:
-    ok, jpeg = cv2.imencode(
-        ".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+def set_model_state(**updates: Any) -> None:
+    with model_lock:
+        for key, value in updates.items():
+            setattr(app.state, key, value)
+
+
+def model_snapshot() -> dict[str, Any]:
+    with settings_lock:
+        configured_engine_path = settings["engine_path"]
+    with model_lock:
+        return {
+            "model_status": getattr(app.state, "model_status", "loading"),
+            "startup_test_status": getattr(app.state, "startup_test_status", "pending"),
+            "engine_path": getattr(app.state, "engine_path", configured_engine_path),
+            "startup_test_result": getattr(app.state, "startup_test_result", None),
+            "last_error": getattr(app.state, "last_error", None),
+        }
+
+
+def start_model_loading(app_obj: FastAPI) -> None:
+    global model_loader_thread
+    with settings_lock:
+        engine_path = settings["engine_path"]
+        startup_test_prompt = settings["startup_test_prompt"]
+
+    with model_lock:
+        generation = getattr(app_obj.state, "model_generation", 0) + 1
+        app_obj.state.model_generation = generation
+        app_obj.state.vlm_engine = None
+        app_obj.state.model_status = "loading"
+        app_obj.state.startup_test_status = "pending"
+        app_obj.state.engine_path = engine_path
+        app_obj.state.startup_test_result = None
+        app_obj.state.last_error = None
+
+    model_loader_thread = threading.Thread(
+        target=model_loader_worker,
+        args=(app_obj, generation, engine_path, startup_test_prompt),
+        daemon=True,
     )
-    if not ok:
-        raise RuntimeError("failed to encode frame")
-    return base64.b64encode(jpeg.tobytes()).decode("ascii")
+    model_loader_thread.start()
+    emit_status("TensorRT engine loading...", "model_loading")
+
+
+def model_loader_worker(
+    app_obj: FastAPI,
+    generation: int,
+    engine_path: str,
+    startup_test_prompt: str,
+) -> None:
+    try:
+        engine = TensorRTQwenVL(engine_path)
+        test_frame = get_latest_frame_copy()
+        if test_frame is None:
+            test_frame = create_startup_test_image()
+
+        with vlm_call_lock:
+            raw_result = engine.infer(test_frame, startup_test_prompt)
+        parsed = parse_engine_result(raw_result)
+        if "found" not in parsed:
+            raise ValueError("startup test result does not contain found field")
+
+        with model_lock:
+            if generation != getattr(app_obj.state, "model_generation", None):
+                return
+            app_obj.state.vlm_engine = engine
+            app_obj.state.model_status = "ready"
+            app_obj.state.startup_test_status = "success"
+            app_obj.state.startup_test_result = parsed
+            app_obj.state.last_error = None
+        emit_status("TensorRT engine ready", "model_ready")
+    except Exception as exc:
+        with model_lock:
+            if generation != getattr(app_obj.state, "model_generation", None):
+                return
+            app_obj.state.vlm_engine = None
+            app_obj.state.model_status = "failed"
+            app_obj.state.startup_test_status = "failed"
+            app_obj.state.startup_test_result = None
+            app_obj.state.last_error = str(exc)
+        emit_status(f"TensorRT engine failed: {exc}", "model_failed")
+
+
+def create_startup_test_image():
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    image[:] = (18, 24, 20)
+    cv2.putText(
+        image,
+        "TensorRT Qwen2.5-VL startup test",
+        (42, 230),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (120, 210, 110),
+        2,
+        cv2.LINE_AA,
+    )
+    return image
+
+
+def get_ready_engine() -> TensorRTQwenVL:
+    with model_lock:
+        model_status = getattr(app.state, "model_status", "loading")
+        engine = getattr(app.state, "vlm_engine", None)
+    if model_status != "ready" or engine is None:
+        raise RuntimeError(f"model is not ready: {model_status}")
+    return engine
 
 
 def bbox_prompt(user_prompt: str) -> str:
@@ -254,32 +368,24 @@ def bbox_prompt(user_prompt: str) -> str:
 설명 문장은 출력하지 마라."""
 
 
-def verify_prompt(user_prompt: str) -> str:
-    return f"""이미지에는 현재 추적 중인 bbox 주변 crop이 들어 있다.
-다음 조건에 해당하는 대상이 이미지 안에 아직 존재하는지 검증하라.
-
+def verify_prompt(current_prompt: str) -> str:
+    return f"""현재 추적 중인 대상이 이미지 안에 아직 존재하는지 확인해라.
 조건:
-"{user_prompt}"
+"{current_prompt}"
 
-반드시 아래 JSON 형식으로만 답하라.
-대상이 없거나 다른 대상이면 found=false로 답하라.
+반드시 JSON으로만 답해라.
 
 {{
   "found": true,
   "label": "target description",
-  "bbox": [x1, y1, x2, y2],
   "confidence": 0.0
-}}
-
-좌표는 입력 이미지 기준 pixel 좌표다.
-설명 문장은 출력하지 마라."""
+}}"""
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
-
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
@@ -287,6 +393,22 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if not match:
             raise
         return json.loads(match.group(0))
+
+
+def parse_engine_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        return extract_json_object(result)
+    raise TypeError(f"unsupported engine result type: {type(result).__name__}")
+
+
+def coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return bool(value)
 
 
 def clamp_bbox_xyxy(raw_bbox: Any, width: int, height: int) -> list[int]:
@@ -328,57 +450,11 @@ def normalize_vlm_result(
     return result
 
 
-def coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "y"}
-    return bool(value)
-
-
-def call_vlm_json(
-    frame_bgr,
-    prompt: str,
-    require_bbox: bool = True,
-) -> dict[str, Any]:
-    with settings_lock:
-        vllm_url = settings["vllm_url"]
-        model_path = settings["model_path"]
-        api_key = settings["api_key"]
-        jpeg_quality = int(settings["jpeg_quality"])
-
-    b64 = encode_frame_base64(frame_bgr, quality=jpeg_quality)
-    payload = {
-        "model": model_path,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": 256,
-        "temperature": 0,
-        "stream": False,
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    response = requests.post(
-        chat_completions_url(vllm_url),
-        json=payload,
-        headers=headers,
-        timeout=(5, 60),
-    )
-    response.raise_for_status()
-    body = response.json()
-    content = body["choices"][0]["message"]["content"]
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    parsed = extract_json_object(str(content))
+def infer_vlm_json(frame_bgr, prompt: str, require_bbox: bool) -> dict[str, Any]:
+    engine = get_ready_engine()
+    with vlm_call_lock:
+        raw_result = engine.infer(frame_bgr, prompt)
+    parsed = parse_engine_result(raw_result)
     return normalize_vlm_result(parsed, frame_bgr.shape, require_bbox=require_bbox)
 
 
@@ -389,7 +465,7 @@ def create_csrt_tracker():
     if hasattr(cv2, "TrackerCSRT_create"):
         return cv2.TrackerCSRT_create()
     raise RuntimeError(
-        "OpenCV CSRT tracker is unavailable. Install opencv-contrib-python."
+        "OpenCV CSRT tracker is unavailable. Install opencv-contrib-python-headless."
     )
 
 
@@ -414,7 +490,7 @@ def tracking_snapshot() -> dict[str, Any]:
     with tracking_lock:
         return {
             "active": bool(tracking_state["active"]),
-            "state": tracking_state["state"],
+            "status": tracking_state["status"],
             "prompt": tracking_state["prompt"],
             "bbox": list(tracking_state["bbox"]) if tracking_state["bbox"] else None,
             "label": tracking_state["label"],
@@ -426,28 +502,39 @@ def tracking_snapshot() -> dict[str, Any]:
 
 
 def current_status() -> dict[str, Any]:
+    model = model_snapshot()
     with settings_lock:
         configured_rtsp_url = settings["rtsp_url"]
     with stream_lock:
-        stream = {
-            "running": bool(stream_state["running"]),
-            "rtsp_url": stream_state["rtsp_url"] or configured_rtsp_url,
-            "error": stream_state["error"],
-        }
+        stream_running = bool(stream_state["running"])
+        stream_error = stream_state["error"]
+        rtsp_url = stream_state["rtsp_url"] or configured_rtsp_url
     track = tracking_snapshot()
     return {
-        "stream": stream,
-        "tracking": {
-            "active": track["active"],
-            "state": track["state"],
-            "locating": track["locating"],
-            "verifying": track["verifying"],
-        },
-        "prompt": track["prompt"],
+        "model_status": model["model_status"],
+        "startup_test_status": model["startup_test_status"],
+        "engine_path": model["engine_path"],
+        "startup_test_result": model["startup_test_result"],
+        "stream_status": "running" if stream_running else "stopped",
+        "tracking_status": track["status"],
+        "tracking_busy": track["locating"] or track["verifying"],
+        "current_prompt": track["prompt"],
         "bbox": track["bbox"],
         "label": track["label"],
         "confidence": track["confidence"],
         "last_verify_result": track["last_verify_result"],
+        "last_error": model["last_error"] or stream_error,
+        "stream": {
+            "running": stream_running,
+            "rtsp_url": rtsp_url,
+            "error": stream_error,
+        },
+        "tracking": {
+            "active": track["active"],
+            "state": track["status"],
+            "locating": track["locating"],
+            "verifying": track["verifying"],
+        },
     }
 
 
@@ -463,14 +550,16 @@ def stop_tracking_state(state: str = "idle", message: str = "tracking stopped") 
         tracking_state.update(
             {
                 "active": False,
-                "state": state,
+                "status": state,
                 "bbox": None,
                 "label": "",
                 "confidence": None,
                 "locating": False,
                 "verifying": False,
                 "last_verify_result": {
-                    "ok": None,
+                    "found": None,
+                    "label": "",
+                    "confidence": None,
                     "message": message,
                     "time": now_iso(),
                 },
@@ -530,7 +619,7 @@ def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
     with tracking_lock:
         if (
             not tracking_state["active"]
-            or tracking_state["state"] != "tracking"
+            or tracking_state["status"] != "tracking"
             or tracking_state["verifying"]
         ):
             return
@@ -552,15 +641,14 @@ def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
 
 def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
     global tracker
-    ok = False
-    message = ""
+    found = False
     result: dict[str, Any] | None = None
+    message = ""
 
     try:
-        with vlm_call_lock:
-            result = call_vlm_json(frame_bgr, verify_prompt(prompt), require_bbox=False)
-        ok = bool(result["found"])
-        message = "target_verified" if ok else "target_not_found"
+        result = infer_vlm_json(frame_bgr, verify_prompt(prompt), require_bbox=False)
+        found = bool(result["found"])
+        message = "target_verified" if found else "target_not_found"
     except Exception as exc:
         message = f"verify_error: {exc}"
 
@@ -569,20 +657,21 @@ def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
             return
         tracking_state["verifying"] = False
         tracking_state["last_verify_result"] = {
-            "ok": ok,
+            "found": found,
+            "label": result["label"] if result else "",
+            "confidence": result["confidence"] if result else None,
             "message": message,
             "time": now_iso(),
-            "result": result,
         }
-        if ok:
-            tracking_state["state"] = "tracking"
+        if found:
+            tracking_state["status"] = "tracking"
         else:
             tracker = None
             tracking_state["active"] = False
-            tracking_state["state"] = "verify_failed"
+            tracking_state["status"] = "verify_failed"
             tracking_state["bbox"] = None
 
-    if ok:
+    if found:
         emit_status("검증 성공", "verify_result")
     else:
         emit_status("검증 실패 / 재탐색 필요", "verify_failed")
@@ -625,23 +714,27 @@ def rtsp_capture_worker(rtsp_url: str, stop_event: threading.Event, generation: 
                 except Exception as exc:
                     updated = False
                     tracking_state["last_verify_result"] = {
-                        "ok": False,
+                        "found": False,
+                        "label": "",
+                        "confidence": None,
                         "message": f"tracker_error: {exc}",
                         "time": now_iso(),
                     }
 
                 if updated:
                     tracking_state["bbox"] = current_bbox
-                    tracking_state["state"] = "tracking"
+                    tracking_state["status"] = "tracking"
                 else:
                     tracking_state["request_id"] += 1
                     tracker = None
                     tracking_state["active"] = False
-                    tracking_state["state"] = "lost"
+                    tracking_state["status"] = "lost"
                     tracking_state["bbox"] = None
                     tracking_state["verifying"] = False
                     tracking_state["last_verify_result"] = {
-                        "ok": False,
+                        "found": False,
+                        "label": "",
+                        "confidence": None,
                         "message": "tracker_update_failed",
                         "time": now_iso(),
                     }
@@ -712,19 +805,23 @@ def stop_stream() -> None:
     stop_tracking_state("idle", "stream stopped")
 
 
-def start_tracking(prompt: str) -> tuple[bool, str]:
+def prepare_tracking_request(prompt: str) -> tuple[bool, str, Any | None, int | None]:
     global tracker
     prompt = prompt.strip()
     if not prompt:
-        return False, "prompt is empty"
+        return False, "prompt is empty", None, None
+
+    model = model_snapshot()
+    if model["model_status"] != "ready":
+        return False, f"model is not ready: {model['model_status']}", None, None
 
     with stream_lock:
         if not stream_state["running"]:
-            return False, "stream is not running"
+            return False, "stream is not running", None, None
 
     frame = get_latest_frame_copy()
     if frame is None:
-        return False, "latest frame is not ready"
+        return False, "latest frame is not ready", None, None
 
     with tracking_lock:
         tracking_state["request_id"] += 1
@@ -733,7 +830,7 @@ def start_tracking(prompt: str) -> tuple[bool, str]:
         tracking_state.update(
             {
                 "active": False,
-                "state": "locating",
+                "status": "locating",
                 "prompt": prompt,
                 "bbox": None,
                 "label": "",
@@ -741,67 +838,82 @@ def start_tracking(prompt: str) -> tuple[bool, str]:
                 "locating": True,
                 "verifying": False,
                 "last_verify_result": {
-                    "ok": None,
+                    "found": None,
+                    "label": "",
+                    "confidence": None,
                     "message": "locating_target",
                     "time": now_iso(),
                 },
             }
         )
+    return True, "locating target", frame, request_id
 
+
+def start_tracking(prompt: str) -> tuple[bool, str]:
+    ok, message, frame, request_id = prepare_tracking_request(prompt)
+    if not ok:
+        return False, message
     threading.Thread(
-        target=start_tracking_worker,
-        args=(frame, prompt, request_id),
+        target=locate_and_start_tracking,
+        args=(frame, prompt.strip(), request_id),
         daemon=True,
     ).start()
-    return True, "locating target"
+    return True, message
 
 
-def start_tracking_worker(frame_bgr, prompt: str, request_id: int) -> None:
+def locate_and_start_tracking(frame_bgr, prompt: str, request_id: int) -> dict[str, Any]:
     global tracker
     emit_status(f"[{now_text()}] 대상 검색 중...", "tracking_start")
     try:
-        with vlm_call_lock:
-            result = call_vlm_json(frame_bgr, bbox_prompt(prompt), require_bbox=True)
+        result = infer_vlm_json(frame_bgr, bbox_prompt(prompt), require_bbox=True)
     except Exception as exc:
         with tracking_lock:
             if request_id != tracking_state["request_id"]:
-                return
+                return {"ok": False, "status": "stale_request", "message": "stale request"}
             tracking_state.update(
                 {
                     "active": False,
-                    "state": "error",
+                    "status": "error",
                     "locating": False,
                     "bbox": None,
                     "last_verify_result": {
-                        "ok": False,
+                        "found": False,
+                        "label": "",
+                        "confidence": None,
                         "message": f"target_lookup_error: {exc}",
                         "time": now_iso(),
                     },
                 }
             )
         emit_status(f"대상 검색 오류: {exc}", "tracking_failed")
-        return
+        return {"ok": False, "status": "target_lookup_error", "message": str(exc)}
 
     if not result["found"]:
         with tracking_lock:
             if request_id != tracking_state["request_id"]:
-                return
+                return {"ok": False, "status": "stale_request", "message": "stale request"}
             tracking_state.update(
                 {
                     "active": False,
-                    "state": "not_found",
+                    "status": "not_found",
                     "locating": False,
                     "bbox": None,
                     "last_verify_result": {
-                        "ok": False,
+                        "found": False,
+                        "label": result["label"],
+                        "confidence": result["confidence"],
                         "message": "target_not_found",
                         "time": now_iso(),
-                        "result": result,
                     },
                 }
             )
         emit_status("대상을 찾지 못했습니다", "tracking_failed")
-        return
+        return {
+            "ok": False,
+            "status": "target_not_found",
+            "bbox": None,
+            "label": result["label"],
+        }
 
     try:
         new_tracker = create_csrt_tracker()
@@ -811,31 +923,33 @@ def start_tracking_worker(frame_bgr, prompt: str, request_id: int) -> None:
     except Exception as exc:
         with tracking_lock:
             if request_id != tracking_state["request_id"]:
-                return
+                return {"ok": False, "status": "stale_request", "message": "stale request"}
             tracking_state.update(
                 {
                     "active": False,
-                    "state": "error",
+                    "status": "error",
                     "locating": False,
                     "bbox": None,
                     "last_verify_result": {
-                        "ok": False,
+                        "found": False,
+                        "label": result["label"],
+                        "confidence": result["confidence"],
                         "message": f"tracker_init_error: {exc}",
                         "time": now_iso(),
                     },
                 }
             )
         emit_status(f"트래커 시작 오류: {exc}", "tracking_failed")
-        return
+        return {"ok": False, "status": "tracker_init_error", "message": str(exc)}
 
     with tracking_lock:
         if request_id != tracking_state["request_id"]:
-            return
+            return {"ok": False, "status": "stale_request", "message": "stale request"}
         tracker = new_tracker
         tracking_state.update(
             {
                 "active": True,
-                "state": "tracking",
+                "status": "tracking",
                 "bbox": result["bbox"],
                 "label": result["label"],
                 "confidence": result["confidence"],
@@ -843,14 +957,40 @@ def start_tracking_worker(frame_bgr, prompt: str, request_id: int) -> None:
                 "verifying": False,
                 "last_verify_at": time.time(),
                 "last_verify_result": {
-                    "ok": True,
+                    "found": True,
+                    "label": result["label"],
+                    "confidence": result["confidence"],
                     "message": "target_found",
                     "time": now_iso(),
-                    "result": result,
                 },
             }
         )
     emit_status("추적 시작", "tracking_started")
+    return {
+        "ok": True,
+        "status": "tracking_started",
+        "bbox": result["bbox"],
+        "label": result["label"],
+    }
+
+
+def start_tracking_and_wait(prompt: str) -> dict[str, Any]:
+    ok, message, frame, request_id = prepare_tracking_request(prompt)
+    if not ok:
+        return {"ok": False, "status": "rejected", "message": message}
+
+    done = threading.Event()
+    output: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            output.update(locate_and_start_tracking(frame, prompt.strip(), request_id))
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    done.wait()
+    return output
 
 
 def mjpeg_generator():
@@ -899,6 +1039,17 @@ def api_status():
     return JSONResponse(current_status())
 
 
+@app.post("/api/track/start")
+def api_track_start(payload: TrackStartRequest):
+    return JSONResponse(start_tracking_and_wait(payload.prompt))
+
+
+@app.post("/api/track/stop")
+def api_track_stop():
+    stop_tracking_state("idle", "tracking stopped by REST")
+    return JSONResponse({"ok": True, "status": "tracking_stopped"})
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
@@ -906,10 +1057,13 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_json()
-            action = data.get("action")
+            action = data.get("action") or data.get("type")
 
             if action == "start_stream":
-                update_settings_from_payload(data)
+                _, reload_model = update_settings_from_payload(data)
+                if reload_model:
+                    stop_tracking_state("idle", "engine settings changed")
+                    start_model_loading(app)
                 result = start_stream()
                 await ws.send_json(
                     {
@@ -948,7 +1102,10 @@ async def websocket_endpoint(ws: WebSocket):
                 )
 
             elif action == "save_settings":
-                update_settings_from_payload(data)
+                _, engine_changed = update_settings_from_payload(data)
+                if engine_changed:
+                    stop_tracking_state("idle", "engine changed")
+                    start_model_loading(app)
                 with settings_lock:
                     saved_settings = dict(settings)
                 await ws.send_json(
