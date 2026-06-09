@@ -48,6 +48,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "verify_interval_sec": 3,
     "jpeg_quality": 80,
     "startup_test_prompt": "이미지에 사람이 있는지 확인하고 있으면 bbox를 JSON으로 반환해줘.",
+    "min_confidence": 0.3,
 }
 SETTINGS_KEYS = set(DEFAULT_SETTINGS)
 
@@ -158,6 +159,12 @@ def coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
             )
         except (TypeError, ValueError):
             cleaned["jpeg_quality"] = DEFAULT_SETTINGS["jpeg_quality"]
+
+    if "min_confidence" in cleaned:
+        try:
+            cleaned["min_confidence"] = max(0.0, min(1.0, float(cleaned["min_confidence"])))
+        except (TypeError, ValueError):
+            cleaned["min_confidence"] = DEFAULT_SETTINGS["min_confidence"]
 
     return cleaned
 
@@ -484,6 +491,29 @@ def verify_prompt(current_prompt: str) -> str:
   "label": "target description",
   "confidence": 0.0
 }}"""
+
+
+def verify_bbox_prompt(current_prompt: str) -> str:
+    return f"""현재 추적 중인 대상이 이미지 안에 아직 존재하는지 확인하고, 존재한다면 정확한 위치(bbox)도 함께 반환해라.
+
+조건:
+"{current_prompt}"
+
+반드시 아래 JSON 형식으로만 답해라.
+대상이 있으면:
+{{
+  "found": true,
+  "label": "target description",
+  "bbox": [x1, y1, x2, y2],
+  "confidence": 0.0
+}}
+
+대상이 없으면:
+{{
+  "found": false
+}}
+
+좌표는 원본 이미지 기준 pixel 좌표다. 설명 문장은 출력하지 마라."""
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -832,9 +862,7 @@ def crop_bbox(frame_bgr, bbox: list[int]):
     return frame_bgr[y1:y2, x1:x2].copy()
 
 
-def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
-    if not bbox:
-        return
+def maybe_start_verification(frame_bgr) -> None:
     with settings_lock:
         interval = float(settings["verify_interval_sec"])
     now = time.time()
@@ -844,6 +872,7 @@ def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
             not tracking_state["active"]
             or tracking_state["status"] != "tracking"
             or tracking_state["verifying"]
+            or not tracking_state["targets"]
         ):
             return
         if now - float(tracking_state["last_verify_at"]) < interval:
@@ -853,10 +882,9 @@ def maybe_start_verification(frame_bgr, bbox: list[int] | None) -> None:
         prompt = tracking_state["prompt"]
         request_id = tracking_state["request_id"]
 
-    crop = crop_bbox(frame_bgr, bbox)
     threading.Thread(
         target=verify_worker,
-        args=(crop, prompt, request_id),
+        args=(frame_bgr.copy(), prompt, request_id),
         daemon=True,
     ).start()
     emit_status("대상 검증 중...", "verify_start")
@@ -867,11 +895,21 @@ def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
     found = False
     result: dict[str, Any] | None = None
     message = ""
+    new_tracker = None
+    new_bbox: list[int] | None = None
 
     try:
-        result = infer_vlm_json(frame_bgr, verify_prompt(prompt), require_bbox=False)
+        result = infer_vlm_json(frame_bgr, verify_bbox_prompt(prompt), require_bbox=False)
         found = bool(result["found"])
         message = "target_verified" if found else "target_not_found"
+        if found and result.get("bbox"):
+            try:
+                h, w = frame_bgr.shape[:2]
+                new_bbox = clamp_bbox_xyxy(result["bbox"], w, h)
+                new_tracker = create_tracker_for_bbox(frame_bgr, new_bbox)
+            except Exception:
+                new_bbox = None
+                new_tracker = None
     except Exception as exc:
         message = f"verify_error: {exc}"
 
@@ -888,6 +926,18 @@ def verify_worker(frame_bgr, prompt: str, request_id: int) -> None:
         }
         if found:
             tracking_state["status"] = "tracking"
+            if new_tracker is not None and new_bbox is not None and tracking_state["targets"]:
+                target_id = int(tracking_state["targets"][0]["id"])
+                trackers[target_id] = new_tracker
+                tracking_state["targets"][0].update({
+                    "bbox": new_bbox,
+                    "point": bbox_center(new_bbox),
+                    "source": "verify",
+                    "last_seen": now_iso(),
+                    "last_seen_ts": time.time(),
+                    "vlm_miss_count": 0,
+                })
+                tracking_state["bbox"] = new_bbox
         else:
             trackers.clear()
             tracking_state["active"] = False
@@ -961,6 +1011,7 @@ def new_target_record(
         "source": source,
         "last_seen": now_iso(),
         "last_seen_ts": now,
+        "vlm_miss_count": 0,
     }
 
 
@@ -1022,92 +1073,107 @@ def apply_vlm_detections(
     request_id: int,
 ) -> None:
     global next_target_id
-    created = 0
-    updated = 0
-    errors: list[str] = []
+    VLM_MAX_MISS = 3
 
     with settings_lock:
         max_targets = int(settings["max_targets"])
 
+    # Snapshot existing targets for matching (lock released during tracker init)
     with tracking_lock:
         if request_id != tracking_state["request_id"] or not tracking_state["active"]:
             return
-        existing_targets = [dict(target) for target in tracking_state["targets"]]
-        new_targets = existing_targets[:]
-        used_ids: set[int] = set()
+        existing_snapshot = [dict(t) for t in tracking_state["targets"]]
+
+    # Match detections to existing targets and build trackers (no lock held)
+    pending: list[tuple[int | None, dict[str, Any], Any]] = []
+    pre_used: set[int] = set()
+    errors: list[str] = []
 
     for detection in detections[:max_targets]:
-        matched_id = match_detection_to_target(
-            detection,
-            existing_targets,
-            used_ids,
-            frame.shape,
-        )
+        matched_id = match_detection_to_target(detection, existing_snapshot, pre_used, frame.shape)
+        if matched_id is not None:
+            pre_used.add(matched_id)
         try:
             tracker_obj = create_tracker_for_bbox(frame, detection["bbox"])
         except Exception as exc:
             errors.append(str(exc))
+            if matched_id is not None:
+                pre_used.discard(matched_id)
             continue
+        pending.append((matched_id, detection, tracker_obj))
 
-        with tracking_lock:
-            if request_id != tracking_state["request_id"] or not tracking_state["active"]:
-                return
-            if matched_id is None:
-                target_id = next_target_id
-                next_target_id += 1
-                new_targets.append(new_target_record(target_id, detection, "vlm"))
-                created += 1
-            else:
-                target_id = matched_id
-                for index, target in enumerate(new_targets):
-                    if int(target["id"]) == target_id:
-                        new_targets[index] = new_target_record(target_id, detection, "vlm")
-                        updated += 1
-                        break
-            trackers[target_id] = tracker_obj
-            used_ids.add(target_id)
-
-            if len(new_targets) > max_targets:
-                overflow = new_targets[max_targets:]
-                for target in overflow:
-                    trackers.pop(int(target["id"]), None)
-                new_targets = new_targets[:max_targets]
-
-            tracking_state["targets"] = new_targets
-            tracking_state["bbox"] = list(new_targets[0]["bbox"]) if new_targets else None
-            tracking_state["label"] = new_targets[0]["label"] if new_targets else ""
-            tracking_state["confidence"] = new_targets[0]["confidence"] if new_targets else None
-            tracking_state["status"] = "tracking" if new_targets else "searching"
-            tracking_state["locating"] = not bool(new_targets)
-            tracking_state["last_verify_result"] = {
-                "found": bool(detections),
-                "label": f"{len(new_targets)} target(s)",
-                "confidence": None,
-                "message": f"vlm_detected={len(detections)}, updated={updated}, created={created}",
-                "time": now_iso(),
-            }
-
+    # Apply all changes in a single lock acquisition
     with tracking_lock:
         if request_id != tracking_state["request_id"] or not tracking_state["active"]:
             return
-        if not detections:
-            tracking_state["status"] = "tracking" if tracking_state["targets"] else "searching"
-            tracking_state["locating"] = not bool(tracking_state["targets"])
-            tracking_state["last_verify_result"] = {
-                "found": False,
-                "label": "",
-                "confidence": None,
-                "message": "vlm_detected=0; latest frame will keep searching",
-                "time": now_iso(),
-            }
-        if errors and not tracking_state["targets"]:
-            tracking_state["last_verify_result"] = {
-                "found": False,
-                "label": "",
-                "confidence": None,
-                "message": f"tracker_init_error: {errors[0]}",
-                "time": now_iso(),
-            }
+
+        working: list[dict[str, Any]] = [dict(t) for t in tracking_state["targets"]]
+        confirmed_ids: set[int] = set()
+        created = 0
+        updated = 0
+
+        for matched_id, detection, tracker_obj in pending:
+            if matched_id is None:
+                if len(working) >= max_targets:
+                    continue
+                target_id = next_target_id
+                next_target_id += 1
+                record = new_target_record(target_id, detection, "vlm")
+                working.append(record)
+                trackers[target_id] = tracker_obj
+                confirmed_ids.add(target_id)
+                created += 1
+            else:
+                for i, t in enumerate(working):
+                    if int(t["id"]) == matched_id:
+                        record = new_target_record(matched_id, detection, "vlm")
+                        working[i] = record
+                        trackers[matched_id] = tracker_obj
+                        confirmed_ids.add(matched_id)
+                        updated += 1
+                        break
+
+        # Prune targets not confirmed by this VLM scan
+        pruned = 0
+        survived: list[dict[str, Any]] = []
+        for t in working:
+            tid = int(t["id"])
+            if tid in confirmed_ids:
+                t["vlm_miss_count"] = 0
+                survived.append(t)
+            else:
+                miss = t.get("vlm_miss_count", 0) + 1
+                t["vlm_miss_count"] = miss
+                if miss < VLM_MAX_MISS:
+                    survived.append(t)
+                else:
+                    trackers.pop(tid, None)
+                    pruned += 1
+
+        if len(survived) > max_targets:
+            for t in survived[max_targets:]:
+                trackers.pop(int(t["id"]), None)
+            survived = survived[:max_targets]
+
+        tracking_state["targets"] = survived
+        tracking_state["bbox"] = list(survived[0]["bbox"]) if survived else None
+        tracking_state["label"] = survived[0]["label"] if survived else ""
+        tracking_state["confidence"] = survived[0]["confidence"] if survived else None
+        tracking_state["status"] = "tracking" if survived else "searching"
+        tracking_state["locating"] = not bool(survived)
+
+        msg = f"vlm_detected={len(detections)}, updated={updated}, created={created}"
+        if pruned:
+            msg += f", pruned={pruned}"
+        if errors:
+            msg += f", errors={len(errors)}"
+        tracking_state["last_verify_result"] = {
+            "found": bool(survived),
+            "label": f"{len(survived)} target(s)",
+            "confidence": None,
+            "message": msg,
+            "time": now_iso(),
+        }
 
 
 def process_stream_frame(frame) -> None:
@@ -1173,6 +1239,7 @@ def process_stream_frame(frame) -> None:
                 }
 
     publish_jpeg(frame)
+    maybe_start_verification(frame)
 
 
 def rtsp_capture_worker(rtsp_url: str, stop_event: threading.Event, generation: int) -> None:
@@ -1340,10 +1407,16 @@ def continuous_detect_worker(prompt: str, request_id: int) -> None:
 
         with settings_lock:
             max_targets = int(settings["max_targets"])
+            min_conf = float(settings.get("min_confidence", 0.3))
 
         try:
             prompt_text = multi_target_prompt(prompt, max_targets)
             detections = infer_vlm_objects(frame, prompt_text, max_targets=max_targets)
+            if min_conf > 0:
+                detections = [
+                    d for d in detections
+                    if d["confidence"] is None or d["confidence"] >= min_conf
+                ]
             apply_vlm_detections(frame, detections, request_id)
             with tracking_lock:
                 if request_id == tracking_state["request_id"]:
