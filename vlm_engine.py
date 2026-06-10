@@ -54,29 +54,36 @@ class TensorRTQwenVL:
         self.plugin_path = self._resolve_plugin_path()
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-    def infer(self, image_bgr, prompt: str) -> dict[str, Any]:
-        output_text = self._execute_qwen_vl(image_bgr, prompt)
+    def infer(self, images_bgr, prompt: str) -> dict[str, Any]:
+        if isinstance(images_bgr, list):
+            frames = images_bgr
+        else:
+            frames = [images_bgr]
+        output_text = self._execute_qwen_vl(frames, prompt)
         return self._parse_json(output_text)
 
-    def _execute_qwen_vl(self, image_bgr, prompt: str) -> str:
+    def _execute_qwen_vl(self, images_bgr: list, prompt: str) -> str:
         if self.engine_dir is None or self.multimodal_engine_dir is None:
             raise RuntimeError("TensorRT engine dirs are not initialized")
         if self.llm_inference_bin is None:
             raise RuntimeError("llm_inference binary is not initialized")
 
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image_rgb)
-
         with tempfile.TemporaryDirectory(dir=self.work_dir) as tmpdir:
             tmpdir_path = Path(tmpdir)
-            image_path = tmpdir_path / "frame.jpg"
             input_path = tmpdir_path / "input.json"
             output_path = tmpdir_path / "output.json"
 
-            image.save(image_path, quality=95)
+            image_paths: list[str] = []
+            for idx, image_bgr in enumerate(images_bgr):
+                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(image_rgb)
+                image_path = tmpdir_path / f"frame_{idx:03d}.jpg"
+                image.save(image_path, quality=90)
+                image_paths.append(str(image_path))
+
             input_path.write_text(
                 json.dumps(
-                    self._build_input_payload(str(image_path), prompt),
+                    self._build_input_payload(image_paths, prompt),
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -147,24 +154,22 @@ class TensorRTQwenVL:
             )
         return output_text
 
-    def _build_input_payload(self, image_path: str, prompt: str) -> dict[str, Any]:
+    def _build_input_payload(self, image_paths: list[str], prompt: str) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [
+            {"type": "image", "image": p} for p in image_paths
+        ]
+        content.append({"type": "text", "text": prompt})
         return {
             "batch_size": 1,
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": 1,
-            "max_generate_length": 1024,
+            "max_generate_length": 512,
             "requests": [
                 {
                     "messages": [
                         {"role": "system", "content": self.system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image_path},
-                                {"type": "text", "text": prompt},
-                            ],
-                        },
+                        {"role": "user", "content": content},
                     ]
                 }
             ],

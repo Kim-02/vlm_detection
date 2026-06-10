@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TensorRT Prompt Tracker</title>
+  <title>TensorRT Action Detector</title>
   <style>
     :root {
       --bg: #050705;
-      --panel: rgba(8, 12, 10, 0.88);
+      --panel: rgba(8, 12, 10, 0.90);
       --line: rgba(116, 190, 105, 0.28);
       --text: #e7f0e5;
       --muted: #8ba08c;
@@ -17,9 +17,9 @@
       --ok: #78e08f;
     }
 
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
-      margin: 0;
       height: 100vh;
       overflow: hidden;
       background: var(--bg);
@@ -27,6 +27,7 @@
       font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
+    /* ── Video stage ── */
     .stage {
       position: fixed;
       inset: 0;
@@ -52,10 +53,10 @@
       text-transform: uppercase;
     }
 
+    /* ── LIVE badge ── */
     .live {
       position: fixed;
-      left: 18px;
-      top: 18px;
+      left: 18px; top: 18px;
       display: none;
       align-items: center;
       gap: 7px;
@@ -68,17 +69,27 @@
       letter-spacing: 0.14em;
       z-index: 6;
     }
-
     .live.on { display: flex; }
     .live-dot {
-      width: 7px;
-      height: 7px;
+      width: 7px; height: 7px;
       border-radius: 50%;
       background: #ff6a55;
       animation: blink 1s step-end infinite;
     }
     @keyframes blink { 50% { opacity: 0.25; } }
 
+    /* ── Alert flash (video border) ── */
+    .alert-ring {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 4;
+      border: 3px solid transparent;
+      transition: border-color 0.15s;
+    }
+    .alert-ring.on { border-color: rgba(255, 106, 85, 0.85); }
+
+    /* ── Loading screen ── */
     .loading-screen {
       position: fixed;
       inset: 0;
@@ -116,16 +127,16 @@
       overflow-wrap: anywhere;
     }
 
+    /* ── Side panel ── */
     .panel {
       position: fixed;
-      top: 16px;
-      right: 16px;
-      bottom: 16px;
-      width: min(420px, calc(100vw - 32px));
+      top: 16px; right: 16px; bottom: 16px;
+      width: min(400px, calc(100vw - 32px));
       display: none;
       flex-direction: column;
       gap: 10px;
       z-index: 5;
+      overflow-y: auto;
     }
 
     .box {
@@ -134,16 +145,17 @@
       border-radius: 6px;
       backdrop-filter: blur(18px);
       box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+      flex-shrink: 0;
     }
 
-    .section { padding: 13px; }
+    .section { padding: 14px; }
 
     .title-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      margin-bottom: 10px;
+      margin-bottom: 12px;
     }
 
     .title {
@@ -175,7 +187,7 @@
     }
 
     textarea {
-      min-height: 84px;
+      min-height: 72px;
       resize: vertical;
       padding: 10px;
       line-height: 1.45;
@@ -204,6 +216,7 @@
       letter-spacing: 0.08em;
       color: #071006;
       background: var(--accent);
+      transition: opacity 0.15s;
     }
 
     button.secondary {
@@ -219,34 +232,56 @@
 
     button:disabled {
       cursor: not-allowed;
-      opacity: 0.45;
+      opacity: 0.42;
     }
 
+    /* ── Status grid ── */
     .status-grid {
       display: grid;
-      grid-template-columns: 128px 1fr;
-      gap: 8px 10px;
+      grid-template-columns: 110px 1fr;
+      gap: 7px 10px;
       font-size: 13px;
       line-height: 1.4;
     }
 
     .status-grid .k { color: var(--muted); }
-    .status-grid .v {
-      min-width: 0;
-      overflow-wrap: anywhere;
-    }
+    .status-grid .v { min-width: 0; overflow-wrap: anywhere; }
 
     .good { color: var(--ok); }
     .warn { color: var(--warn); }
-    .bad { color: var(--bad); }
+    .bad  { color: var(--bad); }
 
-    .settings {
-      overflow: auto;
-      min-height: 0;
+    /* ── Detection result card ── */
+    .result-card {
+      margin-top: 12px;
+      border: 1px solid rgba(116, 190, 105, 0.18);
+      border-radius: 4px;
+      padding: 10px 12px;
+      background: rgba(0, 0, 0, 0.25);
+      min-height: 56px;
     }
 
-    .field { margin-bottom: 9px; }
+    .result-status {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
 
+    .result-desc {
+      font-size: 12px;
+      color: #b8d4b5;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .result-card.detected {
+      border-color: rgba(120, 224, 143, 0.55);
+      background: rgba(0, 255, 80, 0.05);
+    }
+
+    /* ── Settings ── */
+    .settings { overflow: auto; }
+    .field { margin-bottom: 9px; }
     .field label {
       display: block;
       margin-bottom: 4px;
@@ -266,28 +301,30 @@
 
     @media (max-width: 760px) {
       .panel {
-        left: 10px;
-        right: 10px;
-        top: auto;
-        bottom: 10px;
+        left: 8px; right: 8px;
+        top: auto; bottom: 8px;
         width: auto;
         max-height: 68vh;
       }
-
       .settings { display: none; }
     }
   </style>
 </head>
 <body>
+
   <div class="stage">
-    <img id="videoFeed" alt="CCTV MJPEG stream">
+    <img id="videoFeed" alt="CCTV stream">
     <div class="placeholder" id="placeholder">CCTV 스트림 대기 중</div>
   </div>
 
+  <div class="alert-ring" id="alertRing"></div>
+  <div class="live" id="liveBadge"><span class="live-dot"></span>LIVE</div>
+
+  <!-- Loading screen -->
   <div class="loading-screen" id="loadingScreen">
     <div class="loading-card">
       <div class="loading-title" id="loadingTitle">모델을 로딩 중입니다...</div>
-      <div class="loading-sub">TensorRT engine loading...</div>
+      <div class="loading-sub">TensorRT Qwen2.5-VL engine loading...</div>
       <div class="status-grid">
         <div class="k">engine_path</div><div class="v mono" id="loadingEnginePath">{{ settings.engine_path }}</div>
         <div class="k">llm_inference</div><div class="v mono" id="loadingLlmInference">{{ settings.llm_inference_bin }}</div>
@@ -295,28 +332,30 @@
         <div class="k">startup_test</div><div class="v" id="loadingStartupStatus">pending</div>
         <div class="k">last_error</div><div class="v bad" id="loadingError">-</div>
       </div>
-      <div class="buttons">
+      <div class="buttons" style="margin-top:16px;">
         <button onclick="reloadModel()">모델 다시 로딩</button>
         <button class="secondary" onclick="saveSettings()">설정 저장 후 로딩</button>
       </div>
     </div>
   </div>
 
-  <div class="live" id="liveBadge"><span class="live-dot"></span>LIVE</div>
-
+  <!-- Main panel -->
   <main class="panel" id="appPanel">
+
+    <!-- Action detection -->
     <section class="box section">
       <div class="title-row">
-        <div class="title">Prompt Tracking</div>
+        <div class="title">행동 감지</div>
         <div class="state" id="socketState">연결 중</div>
       </div>
-      <textarea id="promptInput" placeholder="예: 노란 안전모를 쓴 작업자"></textarea>
+      <textarea id="promptInput" placeholder="예: 휴대폰을 사용하는 사람&#10;예: 뛰거나 빠르게 이동하는 사람&#10;예: 물건을 들고 이동하는 사람"></textarea>
       <div class="buttons">
-        <button onclick="startTracking()">찾기/추적 시작</button>
-        <button class="secondary" onclick="stopTracking()">추적 중지</button>
+        <button id="btnStart" onclick="startDetection()">감지 시작</button>
+        <button class="secondary" id="btnStop" onclick="stopDetection()">감지 중지</button>
       </div>
     </section>
 
+    <!-- Status -->
     <section class="box section">
       <div class="title-row">
         <div class="title">Status</div>
@@ -324,19 +363,25 @@
       </div>
       <div class="status-grid">
         <div class="k">모델</div><div class="v" id="modelStatus">loading</div>
-        <div class="k">스타트업 테스트</div><div class="v" id="startupStatus">pending</div>
+        <div class="k">스타트업</div><div class="v" id="startupStatus">pending</div>
         <div class="k">스트림</div><div class="v" id="streamStatus">대기</div>
-        <div class="k">추적</div><div class="v" id="trackingStatus">대기</div>
-        <div class="k">Targets</div><div class="v" id="bboxStatus">-</div>
-        <div class="k">검증</div><div class="v" id="verifyStatus">-</div>
-        <div class="k">프롬프트</div><div class="v" id="promptStatus">-</div>
+        <div class="k">감지</div><div class="v" id="detectionStatus">대기</div>
+        <div class="k">분석 상태</div><div class="v" id="analysisStatus">-</div>
       </div>
-      <div class="buttons">
+
+      <!-- Detection result card -->
+      <div class="result-card" id="resultCard">
+        <div class="result-status" id="resultStatus" style="color:var(--muted)">결과 없음</div>
+        <div class="result-desc" id="resultDesc"></div>
+      </div>
+
+      <div class="buttons" style="margin-top:12px;">
         <button onclick="startStream()">START STREAM</button>
         <button class="danger" onclick="stopStream()">STOP STREAM</button>
       </div>
     </section>
 
+    <!-- Settings -->
     <section class="box section settings">
       <div class="title-row">
         <div class="title">Settings</div>
@@ -351,7 +396,7 @@
         <input id="enginePath" value="{{ settings.engine_path }}">
       </div>
       <div class="field">
-        <label for="llmInferenceBin">llm_inference</label>
+        <label for="llmInferenceBin">LLM Inference Binary</label>
         <input id="llmInferenceBin" value="{{ settings.llm_inference_bin }}">
       </div>
       <div class="field">
@@ -363,12 +408,12 @@
         <input id="captureFps" type="number" min="1" max="120" value="{{ settings.capture_fps }}">
       </div>
       <div class="field">
-        <label for="maxTargets">Max Targets</label>
-        <input id="maxTargets" type="number" min="1" max="12" value="{{ settings.max_targets }}">
+        <label for="framesPerRequest">Frames per Request (분석에 사용할 프레임 수)</label>
+        <input id="framesPerRequest" type="number" min="1" max="30" value="{{ settings.frames_per_request }}">
       </div>
       <div class="field">
-        <label for="verifyInterval">Verify Interval Sec</label>
-        <input id="verifyInterval" type="number" min="1" step="0.5" value="{{ settings.verify_interval_sec }}">
+        <label for="analysisInterval">Analysis Interval (초)</label>
+        <input id="analysisInterval" type="number" min="0.5" step="0.5" value="{{ settings.analysis_interval_sec }}">
       </div>
       <div class="field">
         <label for="jpegQuality">JPEG Quality</label>
@@ -382,35 +427,42 @@
       <button class="secondary" onclick="reloadModel()" style="margin-top:8px;width:100%;">모델 다시 로딩</button>
       <div class="save-line" id="saveLine"></div>
     </section>
+
   </main>
 
   <script>
-    const videoFeed = document.getElementById('videoFeed');
-    const placeholder = document.getElementById('placeholder');
-    const liveBadge = document.getElementById('liveBadge');
-    const socketState = document.getElementById('socketState');
-    const saveLine = document.getElementById('saveLine');
+    const videoFeed    = document.getElementById('videoFeed');
+    const placeholder  = document.getElementById('placeholder');
+    const liveBadge    = document.getElementById('liveBadge');
+    const socketState  = document.getElementById('socketState');
+    const saveLine     = document.getElementById('saveLine');
+    const alertRing    = document.getElementById('alertRing');
     const loadingScreen = document.getElementById('loadingScreen');
-    const appPanel = document.getElementById('appPanel');
-    let ws;
+    const appPanel     = document.getElementById('appPanel');
 
+    let ws;
+    let alertTimer = null;
+
+    // ── Settings payload ──────────────────────────────────────────────────────
     function settingsPayload() {
       return {
-        rtsp_url: document.getElementById('rtspUrl').value.trim(),
-        engine_path: document.getElementById('enginePath').value.trim(),
-        llm_inference_bin: document.getElementById('llmInferenceBin').value.trim(),
-        plugin_path: document.getElementById('pluginPath').value.trim(),
-        capture_fps: Number(document.getElementById('captureFps').value) || 30,
-        max_targets: Number(document.getElementById('maxTargets').value) || 12,
-        verify_interval_sec: Number(document.getElementById('verifyInterval').value) || 3,
-        jpeg_quality: Number(document.getElementById('jpegQuality').value) || 80,
-        startup_test_prompt: document.getElementById('startupPrompt').value.trim()
+        rtsp_url:             document.getElementById('rtspUrl').value.trim(),
+        engine_path:          document.getElementById('enginePath').value.trim(),
+        llm_inference_bin:    document.getElementById('llmInferenceBin').value.trim(),
+        plugin_path:          document.getElementById('pluginPath').value.trim(),
+        capture_fps:          Number(document.getElementById('captureFps').value)      || 30,
+        frames_per_request:   Number(document.getElementById('framesPerRequest').value) || 10,
+        analysis_interval_sec: Number(document.getElementById('analysisInterval').value) || 1.0,
+        jpeg_quality:         Number(document.getElementById('jpegQuality').value)     || 80,
+        startup_test_prompt:  document.getElementById('startupPrompt').value.trim(),
       };
     }
 
+    // ── WebSocket ─────────────────────────────────────────────────────────────
     function connectWs() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       ws = new WebSocket(`${proto}://${location.host}/ws`);
+
       ws.onopen = () => {
         socketState.textContent = '연결됨';
         fetchStatus();
@@ -422,8 +474,13 @@
       ws.onmessage = ({ data }) => {
         const event = JSON.parse(data);
         if (event.status) renderStatus(event.status);
-        if (event.type === 'settings_saved') flashSaved('저장됨');
-        if (event.type === 'verify_failed') flashSaved('검증 실패 / 재탐색 필요', true);
+
+        if (event.type === 'action_detected') {
+          flashAlert();
+        }
+        if (event.type === 'settings_saved') {
+          flashSaved('저장됨');
+        }
       };
     }
 
@@ -437,11 +494,10 @@
       try {
         const resp = await fetch('/api/status', { cache: 'no-store' });
         if (resp.ok) renderStatus(await resp.json());
-      } catch (_) {
-        socketState.textContent = '상태 확인 실패';
-      }
+      } catch (_) {}
     }
 
+    // ── Video controls ────────────────────────────────────────────────────────
     function streamImageOn() {
       videoFeed.src = `/video_feed?t=${Date.now()}`;
       videoFeed.style.display = 'block';
@@ -466,19 +522,21 @@
       streamImageOff();
     }
 
-    function startTracking() {
+    // ── Detection controls ────────────────────────────────────────────────────
+    function startDetection() {
       const prompt = document.getElementById('promptInput').value.trim();
       if (!prompt) {
-        flashSaved('프롬프트를 입력하세요', true);
+        flashSaved('감지 조건을 입력하세요', true);
         return;
       }
-      send({ type: 'start_tracking', prompt });
+      send({ type: 'start_detection', prompt });
     }
 
-    function stopTracking() {
-      send({ type: 'stop_tracking' });
+    function stopDetection() {
+      send({ type: 'stop_detection' });
     }
 
+    // ── Model ─────────────────────────────────────────────────────────────────
     function saveSettings() {
       send({ type: 'save_settings', ...settingsPayload() });
     }
@@ -495,79 +553,122 @@
       }
     }
 
+    // ── Alert flash ───────────────────────────────────────────────────────────
+    function flashAlert() {
+      alertRing.classList.add('on');
+      clearTimeout(alertTimer);
+      alertTimer = setTimeout(() => alertRing.classList.remove('on'), 2000);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
     function flashSaved(text, bad = false) {
       saveLine.textContent = text;
       saveLine.className = bad ? 'save-line bad' : 'save-line';
       clearTimeout(saveLine._t);
-      saveLine._t = setTimeout(() => { saveLine.textContent = ''; }, 2400);
+      saveLine._t = setTimeout(() => { saveLine.textContent = ''; }, 2600);
     }
 
-    function stateClass(text, state) {
-      text.className = 'v';
-      if (state === 'ready' || state === 'success' || state === 'running' || state === 'tracking' || state === true) text.classList.add('good');
-      if (state === 'loading' || state === 'pending' || state === 'locating' || state === 'searching' || state === 'detecting' || state === 'verifying') text.classList.add('warn');
-      if (state === 'failed' || state === 'verify_failed' || state === 'lost' || state === 'error' || state === false) text.classList.add('bad');
+    function setClass(el, state) {
+      el.className = 'v';
+      if (state === 'ready' || state === 'success' || state === 'running' || state === true)
+        el.classList.add('good');
+      else if (state === 'loading' || state === 'pending' || state === 'analyzing')
+        el.classList.add('warn');
+      else if (state === 'failed' || state === 'error' || state === false)
+        el.classList.add('bad');
     }
 
+    // ── Render ────────────────────────────────────────────────────────────────
     function renderStatus(status) {
       const ready = status.model_status === 'ready' && status.startup_test_status === 'success';
       loadingScreen.style.display = ready ? 'none' : 'flex';
-      appPanel.style.display = ready ? 'flex' : 'none';
+      appPanel.style.display      = ready ? 'flex' : 'none';
 
-      document.getElementById('loadingEnginePath').textContent = status.engine_path || '-';
+      // Loading screen
+      document.getElementById('loadingEnginePath').textContent  = status.engine_path || '-';
       document.getElementById('loadingLlmInference').textContent = status.llm_inference_bin || '-';
-      document.getElementById('loadingModelStatus').textContent = status.model_status || '-';
+      document.getElementById('loadingModelStatus').textContent  = status.model_status || '-';
       document.getElementById('loadingStartupStatus').textContent = status.startup_test_status || '-';
-      document.getElementById('loadingError').textContent = status.last_error || '-';
-      document.getElementById('loadingTitle').textContent =
+      document.getElementById('loadingError').textContent        = status.last_error || '-';
+      document.getElementById('loadingTitle').textContent        =
         status.model_status === 'failed' ? '모델 로딩 실패' : '모델을 로딩 중입니다...';
 
-      const modelEl = document.getElementById('modelStatus');
+      // Status rows
+      const modelEl   = document.getElementById('modelStatus');
       const startupEl = document.getElementById('startupStatus');
-      const streamEl = document.getElementById('streamStatus');
-      const trackingEl = document.getElementById('trackingStatus');
-      const bboxEl = document.getElementById('bboxStatus');
-      const verifyEl = document.getElementById('verifyStatus');
-      const promptEl = document.getElementById('promptStatus');
+      const streamEl  = document.getElementById('streamStatus');
+      const detectEl  = document.getElementById('detectionStatus');
+      const analysisEl = document.getElementById('analysisStatus');
 
       modelEl.textContent = status.model_status || '-';
-      stateClass(modelEl, status.model_status);
+      setClass(modelEl, status.model_status);
+
       startupEl.textContent = status.startup_test_status || '-';
-      stateClass(startupEl, status.startup_test_status);
+      setClass(startupEl, status.startup_test_status);
 
-      streamEl.textContent = status.stream_status === 'running' ? '스트리밍 중' : '중지됨';
-      stateClass(streamEl, status.stream_status);
-      if (ready && status.stream_status === 'running' && !videoFeed.src) streamImageOn();
-      if (status.stream_status !== 'running' && videoFeed.src) streamImageOff();
+      const streamRunning = status.stream_status === 'running';
+      streamEl.textContent = streamRunning ? '스트리밍 중' : '중지됨';
+      setClass(streamEl, streamRunning ? 'running' : 'stopped');
+      if (ready && streamRunning && !videoFeed.src) streamImageOn();
+      if (!streamRunning && videoFeed.src)          streamImageOff();
 
-      const state = status.tracking_status || 'idle';
-      const labels = {
-        idle: '대기',
-        locating: '대상 검색 중',
-        searching: status.tracking && status.tracking.detecting ? '최신 화면 탐색 중' : '대상 탐색 중',
-        tracking: status.tracking && status.tracking.detecting ? '추적 중 / 최신 화면 분석 중' : '추적 중',
-        not_found: '대상 없음',
-        verify_failed: '검증 실패 / 재탐색 필요',
-        lost: '트래커 실패 / 재탐색 필요',
-        error: '오류'
-      };
-      trackingEl.textContent = labels[state] || state;
-      stateClass(trackingEl, status.tracking && status.tracking.detecting ? 'detecting' : state);
+      const det = status.detection || {};
+      if (!det.active) {
+        detectEl.textContent = '대기';
+        detectEl.className = 'v';
+        analysisEl.textContent = '-';
+        analysisEl.className = 'v';
+      } else if (det.running) {
+        detectEl.textContent = '감지 중';
+        setClass(detectEl, 'analyzing');
+        analysisEl.textContent = '▷ 분석 중...';
+        setClass(analysisEl, 'analyzing');
+      } else {
+        detectEl.textContent = '활성';
+        setClass(detectEl, 'running');
+        analysisEl.textContent = '대기 중';
+        analysisEl.className = 'v';
+      }
 
-      const targets = status.targets || [];
-      bboxEl.textContent = targets.length
-        ? `${targets.length}개 · ${targets.map(t => `#${t.id}(${(t.point || []).join(',')})`).join(' ')}`
-        : '-';
-      promptEl.textContent = status.current_prompt || '-';
+      // Result card
+      const result    = (det.result) || {};
+      const detected  = result.detected === true;
+      const desc      = result.description || '';
+      const conf      = result.confidence;
+      const resultCard   = document.getElementById('resultCard');
+      const resultStatus = document.getElementById('resultStatus');
+      const resultDesc   = document.getElementById('resultDesc');
 
-      const verify = status.last_verify_result || {};
-      verifyEl.textContent = verify.message ? `${verify.found === true ? '성공' : verify.found === false ? '실패' : '-'} · ${verify.message}` : '-';
-      stateClass(verifyEl, verify.found);
+      if (!det.active || result.time === null) {
+        resultCard.className = 'result-card';
+        resultStatus.style.color = 'var(--muted)';
+        resultStatus.textContent = '결과 없음';
+        resultDesc.textContent = '';
+      } else if (det.running) {
+        resultCard.className = 'result-card';
+        resultStatus.style.color = 'var(--warn)';
+        resultStatus.textContent = '▷ 분석 중...';
+        resultDesc.textContent = '';
+      } else if (detected) {
+        resultCard.className = 'result-card detected';
+        const confStr = conf !== null && conf !== undefined ? `  ${Math.round(conf * 100)}%` : '';
+        resultStatus.style.color = 'var(--ok)';
+        resultStatus.textContent = `● 행동 감지됨${confStr}`;
+        resultDesc.textContent = desc;
+      } else {
+        resultCard.className = 'result-card';
+        resultStatus.style.color = 'var(--muted)';
+        resultStatus.textContent = '○ 감지 없음';
+        resultDesc.textContent = desc;
+      }
     }
 
+    // ── Clock ─────────────────────────────────────────────────────────────────
     setInterval(() => {
-      document.getElementById('clock').textContent = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+      document.getElementById('clock').textContent =
+        new Date().toLocaleTimeString('ko-KR', { hour12: false });
     }, 500);
+
     setInterval(fetchStatus, 2000);
 
     connectWs();
